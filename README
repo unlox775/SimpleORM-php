@@ -1,0 +1,140 @@
+SimpleORM Class, for simple-as-possible Object-to-Relational Mapping (for PostgreSQL, MySQL and SQLite)
+
+Example usage:
+
+<code>
+class SimpleORM__DBHProvider extends SimpleORM {
+    protected function provide_dbh() { return get_global_dbh_from_wherever(); }
+    protected function provide_dbh_type() { return 'pg'; } // or 'mysql' or 'sqlite'
+}
+class MyStudent extends SimpleORM__DBHProvider {
+    protected $table       = 'student';
+    protected $primary_key = array( 'student_id' );
+    protected $column_sequences = array( 'student_id' => 'student_student_id_seq' );
+    protected $schema = array( 'student_id'  => array(),
+                               'name'           => array( 'maxlength' => 25, 'required' => true ),
+                               'email'          => array( 'format' => 'email', 'maxlength' => 100, 'required' => true ),
+                               'homepage_url'   => array( 'maxlength' => 100, 'regex' => '/^http:\/\//' ),
+                               'mentor_id'      => array(),
+                               'status'         => array(),
+                               'creation_date'  => array(), # a database-side default will auto fill this in...
+        );
+    protected $relations = array(
+        'mentor' => array( 'relationship' => 'has_one',                 
+                           'include'      => 'model/Teacher.class.php', # A file to require_once(), (should be in include_path)
+                           'class'        => 'Teacher',                 # The class name
+                           'columns'      => 'mentor_id',               # local cols to get the PKey for the new object (can be array if >1 col..)
+            )
+        'classes' => array( 'relationship'      => 'has_many',
+                          'include'             => 'model/Class/Student.class.php', # A file to require_once(), (should be in include_path)
+                          'class'               => 'Class__Student',                # The class name
+                          'foreign_table'       => 'class_student',                 # The table to SELECT FROM
+                          'foreign_key_columns' => 'student_id',                    # The cols in the foreign table that correspond to Your PKey (can be array if >1 col..)
+                          'foreign_table_pkey'  => array('class_id','student_id'),  # The primary key of that table                              (can be array if >1 col..)
+                          'custom_where_clause' => "cancelled IS NOT NULL",         # special condition (other than the FKey column join)
+                          'order_by_clause'     => 'course_name',                   # custom sorting (saves local sorting cost)
+            ),
+        'friends'=> array( 'relationship'                    => 'many_to_many',
+                           'include'                         => 'model/MyStudent.class.php',    # A file to require_once(), (should be in include_path)
+                           'class'                           => 'MyStudent',                    # The class name (NOTE: can be THIS class)
+                           'foreign_table'                   => 'student',                      # The final table of the object we will be getting
+                           'join_table'                      => 'student_peer,'                 # The in-between table that has both pKeys
+                           'foreign_table_pkey'              => 'student_id',                   # The pKey of the final table (NOTE: can be THIS table's pKey)
+                           'change_status_instead_of_delete' => false,                          # OPTIONAL: Instead of delete, set "status" and "inactive_date" columns (requires you add these cols)
+                           'join_table_fixed_values'         => array('peer_type' => 'friend'), # OPTIONAL: Alwyas set (and assume to be set) these cols.  Allows for multi-use of the same table    
+                           'order_by_clause'                 => 'name',                         # custom sorting (fields of both the join (jt.) and foreign table (ft.) are valid)
+                           ),
+        'enemies'=> array( 'relationship'                    => 'many_to_many',
+                           'include'                         => 'model/MyStudent.class.php',    # A file to require_once(), (should be in include_path)
+                           'class'                           => 'MyStudent',                    # The class name (NOTE: can be THIS class)
+                           'foreign_table'                   => 'student',                      # The final table of the object we will be getting
+                           'join_table'                      => 'student_peer',                 # The in-between table that has both pKeys
+                           'foreign_table_pkey'              => 'sst_fr_id',                    # The pKey of the final table (note: can be THIS table's pKey)
+                           'change_status_instead_of_delete' => false,                          # OPTIONAL: Instead of delete, set "status" and "inactive_date" columns (requires you add these cols)
+                           'join_table_fixed_values'         => array('peer_type' => 'enemy'),  # OPTIONAL: Alwyas set (and assume to be set) these cols.  Allows for multi-use of the same table
+                           'order_by_clause'                 => 'name',                         # custom sorting (fields of both the join (jt.) and foreign table (ft.) are valid)
+                           ),
+    );
+
+    public function expell($reason) {
+        foreach ($this->classes as $class_enrollment) {
+            $class_enrollment->cancelled = true;
+            $class_enrollment->save(); # also could have used set_and_save() to do in one step...
+        }
+        $this->set_and_save(array('status','expelled'));
+    }
+}
+
+###  New student
+$newstud = MyStudent();                                                                        # object status = 'not_created'
+$newstud->create(array('name' => 'Bob Dillan', 'email' => 'bob@dillan.com', mentor_id => 11)); # object status = 'active'
+echo $newstud->creation_date;  # this value should have been filled by the database
+$newstud->set_complete_relation('friends',array(18,79,20,728)); # add 4 friends
+$newstud->add_relation('enemies', 666); # add an enemy
+echo $newstud->friends[0]->name;  # Show my first friend's name (sorted by name)
+
+###  Make SURE that student ID=18 is NOT an enemy!
+if ( $newstud->has_relation('enemies', 18) ) {
+    $newstud->remove_relation('enemies', 18);
+}
+
+###  Expell and Delete
+$newstud->expell('Was lazy.');
+$newstud->delete();                                                                            # object status = 'deleted'
+</code>
+
+An instance of this object represents a row in a database table.
+Basically you create your own class extending this class and
+give it some inforation about the table, it's columnes and
+relations to other tables (and SimpleORM objects that represent
+those tables).  Simple ORM then provides standard get, set,
+save, create, and delete methods to operate on that row.
+
+Object Caching
+
+All objects are cached in a global object cache, so that
+multiple instances of the same object row never simultaneously
+exist in memory.  If it were allowed, then changes to one
+object would not be reflected in the other object.  Object
+caching is done by simple "object forwarding": the first
+object created for a given row in the database (e.g. user Fred
+Jones) is created and is a fully qualified object with that
+object's data and relation cache, the second time a new object
+is requested for the same object, the cache is consulted and
+instead of a fully qualified object, a "forwarded" object is
+returned that has no local data cache (e.g. the second object
+is a "symlink to the first Fred Jones object").  When any
+method is called on the "forwarded" object, that method call
+is just routed and re-called on the actual fully qualified
+object.
+
+Object Forwarding and Custom Methods
+
+Because of this, any methods in your extended class that want to
+access object variables, include this line as the first line of
+the method code:
+
+<code>if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();</code>
+
+This just quickly checks if the object is a forwarded object
+and the {@link do_object_forward_method()} method takes care of the
+rest.
+
+Database Compatibility
+
+Most major functions have been tested and just worked on
+PostgreSQL, MySQL and SQLite with little or no modification to
+the original code, due to the fact that the databse operations
+are based on PDO, which does most of the database abstraction.
+Most of the rest of the actual SQL is just generally
+cross-compatible with probably 90% of SQL parsers, so the list
+of supported engines may be higher than just these three.
+
+The primary differences so far in databases are in how you use
+specific features.  For example, in PostgreSQL,
+auto-incrementing values are done with named sequences, so the
+'$column_sequences' definition is required (assoc array, key =
+column name, value = sequence name), but you may omit that for
+engines without named sequences.  This feature essentially
+shadows the PDO behavior.
+
