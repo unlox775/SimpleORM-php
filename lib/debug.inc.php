@@ -74,8 +74,8 @@
  * end-users.
  *
  *
- * @author Dave Buchanan <dave@elikirk.com>
- * @package EliKirk
+ * @author Dave Buchanan <dave@joesvolcano.net>
+ * @package JoesVolcano
  * @version $Id: debug.inc.php,v 1.4 2011/02/03 16:38:59 dave Exp $
  */
 

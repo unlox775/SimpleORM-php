@@ -154,8 +154,8 @@ $GLOBALS['SimpleORM_OBJECT_CACHE'] = array();
  *
  * @see $schema
  * @see $relations
- * @author Dave Buchanan <dave@elikirk.com>
- * @package TSANet
+ * @author Dave Buchanan <dave@joesvolcano.net>
+ * @package SimpleORM
  * @version $Id: SimpleORM.class.php,v 1.3 2009/10/30 18:55:35 dave Exp $
  */
 class SimpleORM {
