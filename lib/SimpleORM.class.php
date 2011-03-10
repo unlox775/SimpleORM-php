@@ -1,7 +1,14 @@
 <?php
-$SimpleORM_OBJECT_CACHE = array();
 
-require_once('validation.inc.php');
+// Debugging
+if ( ! function_exists('bug')
+     && file_exists(dirname('__FILE__') .'/debug.inc.php')
+     ) require_once(dirname('__FILE__') .'/debug.inc.php');
+define('ORM_SQL_PROFILE', true);
+define('ORM_SQL_DEBUG', false);
+define('ORM_SQL_WRITE_DEBUG', false);
+
+$GLOBALS['SimpleORM_OBJECT_CACHE'] = array();
 
 /**
  * SimpleORM Class, for simple-as-possible Object-to-Relational Mapping (for PostgreSQL, MySQL and SQLite)
@@ -12,6 +19,7 @@ require_once('validation.inc.php');
  * class SimpleORM__DBHProvider extends SimpleORM {
  *     protected function provide_dbh()      { return get_global_dbh_from_wherever(); }
  *     protected function provide_dbh_type() { return 'pg'; } // or 'mysql' or 'sqlite'
+ *     protected function include_prefix()   { return ''; } // or '/path/to/lib';
  * }
  * class MyStudent extends SimpleORM__DBHProvider {
  *     protected $table       = 'student';
@@ -30,7 +38,7 @@ require_once('validation.inc.php');
  *                            'include'      => 'model/Teacher.class.php', # A file to require_once(), (should be in include_path)
  *                            'class'        => 'Teacher',                 # The class name
  *                            'columns'      => 'mentor_id',               # local cols to get the PKey for the new object (can be array if >1 col..)
- *             )
+ *             ),
  *         'classes' => array( 'relationship'      => 'has_many',
  *                           'include'             => 'model/Class/Student.class.php', # A file to require_once(), (should be in include_path)
  *                           'class'               => 'Class__Student',                # The class name
@@ -44,7 +52,7 @@ require_once('validation.inc.php');
  *                            'include'                         => 'model/MyStudent.class.php',    # A file to require_once(), (should be in include_path)
  *                            'class'                           => 'MyStudent',                    # The class name (NOTE: can be THIS class)
  *                            'foreign_table'                   => 'student',                      # The final table of the object we will be getting
- *                            'join_table'                      => 'student_peer,'                 # The in-between table that has both pKeys
+ *                            'join_table'                      => 'student_peer',                 # The in-between table that has both pKeys
  *                            'foreign_table_pkey'              => 'student_id',                   # The pKey of the final table (NOTE: can be THIS table's pKey)
  *                            'change_status_instead_of_delete' => false,                          # OPTIONAL: Instead of delete, set "status" and "inactive_date" columns (requires you add these cols)
  *                            'join_table_fixed_values'         => array('peer_type' => 'friend'), # OPTIONAL: Alwyas set (and assume to be set) these cols.  Allows for multi-use of the same table    
@@ -248,7 +256,7 @@ class SimpleORM {
     protected $columns_to_save = array();
     protected $object_forward = null;
     protected $cache_key = null;
-    protected $state = null;
+    protected $obj_state = null;
 
     /** 
      * __construct
@@ -298,7 +306,7 @@ class SimpleORM {
 #            bug("USING CACHE: ".$this->cache_key);
             
                 ###  Blank out some $this data to save memory
-                unset($this->data, $this->table, $this->schema, $this->relations, $this->primary_key, $this->pk_values, $this->dbh, $this->columns_to_save, $this->state, $this->cache_key );
+                unset($this->data, $this->table, $this->schema, $this->relations, $this->primary_key, $this->pk_values, $this->dbh, $this->columns_to_save, $this->obj_state, $this->cache_key );
             }
             else { $SimpleORM_OBJECT_CACHE[$this->cache_key] = $this; }
         }
@@ -310,11 +318,13 @@ class SimpleORM {
             $this->dbh      =& $this->provide_dbh();
             $this->dbh_type =& $this->provide_dbh_type();
         }
+        $GLOBALS['orm_dbh'] = $this->dbh;
     }
 
     protected function provide_dbh() {}
     protected function provide_dbh_type() {}
-
+    protected function include_prefix() { return ''; }
+ 
     /** 
      * exists() - does this row exist and have normal state?
      *
@@ -322,8 +332,8 @@ class SimpleORM {
      */
     public function exists() {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
-        if ( $this->state == 'not_created') return false;
-        return ( $this->state == 'active' || ! is_null($this->get($this->primary_key[0])) );
+        if ( $this->obj_state == 'not_created') return false;
+        return ( $this->obj_state == 'active' || ! is_null($this->get($this->primary_key[0])) );
     }
     /**
      * reset_state() - Quick reset all caches and state
@@ -338,7 +348,7 @@ class SimpleORM {
     public function reset_state() {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         $this->data = array();
-        $this->state = null;
+        $this->obj_state = null;
         $this->clear_relation_cache();
         $this->post_reset_state_handler();
     }
@@ -367,10 +377,10 @@ class SimpleORM {
     public function get($arg1) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         $caller_funcs_to_ignore = array('get','__get','get_relation','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
-        START_TIMER('SimpleORM get', SimpleORM_PROFILE);
+        START_TIMER('SimpleORM get', ORM_SQL_PROFILE);
 
         ###  Quick return for vast common case
-        if ( $this->state != 'deleted' && count( func_get_args() ) == 1 && isset($arg1) && (! is_array($arg1)) && isset($this->data[$arg1]) ) { END_TIMER('SimpleORM get', SimpleORM_PROFILE);  return $this->data[$arg1]; }
+        if ( $this->obj_state != 'deleted' && count( func_get_args() ) == 1 && isset($arg1) && (! is_array($arg1)) && isset($this->data[$arg1]) ) { END_TIMER('SimpleORM get', ORM_SQL_PROFILE);  return $this->data[$arg1]; }
 
         $cols_from_array = false;
         $columns = func_get_args();
@@ -389,15 +399,15 @@ class SimpleORM {
         }
 
         ###  Must be installed and active
-        if ( ! is_null($this->state) && $this->state != 'active' ) {
-            trigger_error( 'Call to get() on a "'. get_class($this) .'" object that is "'. $this->state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+        if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
+            trigger_error( 'Call to get() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
 
         ###  Get all the data if it's not already cached...
-        if ( $this->table && empty( $this->data ) && ( is_null($this->state) || $this->state == 'active' ) ) {
+        if ( $this->table && empty( $this->data ) && ( is_null($this->obj_state) || $this->obj_state == 'active' ) ) {
             if ( is_null( $this->dbh ) ) $this->load_dbh();
-            START_TIMER('SimpleORM get query', SimpleORM_PROFILE);
+            START_TIMER('SimpleORM get query', ORM_SQL_PROFILE);
             $values = array();
             $pk_where = array();  foreach ($this->primary_key as $col) { $pk_where[] = "$col = ?";  $values[] = $this->pk_values[$col]; }
             $sql = "SELECT *
@@ -408,8 +418,8 @@ class SimpleORM {
             ###  If the user has an active account then...
             $this->data = $sth->fetch(PDO::FETCH_ASSOC);
 
-            $this->state = empty($this->data) ? 'not_created' : 'active';
-            END_TIMER('SimpleORM get query', SimpleORM_PROFILE);
+            $this->obj_state = empty($this->data) ? 'not_created' : 'active';
+            END_TIMER('SimpleORM get query', ORM_SQL_PROFILE);
         }
 
         ###  Return an array of the requested columns
@@ -421,7 +431,7 @@ class SimpleORM {
             else                                         { $return_ary[] = $this->get_relation( $col ); }
         }
 
-        END_TIMER('SimpleORM get', SimpleORM_PROFILE);
+        END_TIMER('SimpleORM get', ORM_SQL_PROFILE);
         return ( ! $cols_from_array && count($return_ary) == 1 ) ? $return_ary[0] : $return_ary;
     }
 
@@ -437,7 +447,7 @@ class SimpleORM {
     public function set($to_set) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         $caller_funcs_to_ignore = array('set','set_and_save','__set','__unset','exists','call_user_func_array','do_object_forward_method');
-        START_TIMER('SimpleORM set', SimpleORM_PROFILE);
+        START_TIMER('SimpleORM set', ORM_SQL_PROFILE);
 
         if ( ! is_array($to_set) ) die("You must pass set() an array!");
         
@@ -453,8 +463,8 @@ class SimpleORM {
         if ( empty( $this->data ) ) $this->get($this->primary_key[0]);
 
         ###  Must be installed and active
-        if ( ! $this->exists() && $this->state != 'active' ) {
-            trigger_error( 'Call to set() on a "'. get_class($this) .'" object that is "'. $this->state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+        if ( ! $this->exists() && $this->obj_state != 'active' ) {
+            trigger_error( 'Call to set() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
         
@@ -464,7 +474,7 @@ class SimpleORM {
             $this->data[ $col ] = $to_set[ $col ];
         }
  
-        END_TIMER('SimpleORM set', SimpleORM_PROFILE);
+        END_TIMER('SimpleORM set', ORM_SQL_PROFILE);
         return true;
     }
     /** 
@@ -473,6 +483,15 @@ class SimpleORM {
     public function unsaved_columns() {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         return $this->columns_to_save;
+    }
+
+    public function get_table() {
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        return $this->table;
+    }
+    public function get_primary_key() {
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        return $this->primary_key;
     }
 
     /** 
@@ -487,8 +506,8 @@ class SimpleORM {
         $caller_funcs_to_ignore = array('save','set_and_save','exists','call_user_func_array','do_object_forward_method');
 
         ###  Must be installed and active
-        if ( ! $this->exists() && $this->state != 'active' ) {
-            trigger_error( 'Call to save() on a "'. get_class($this) .'" object that is "'. $this->state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+        if ( ! $this->exists() && $this->obj_state != 'active' ) {
+            trigger_error( 'Call to save() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
         if ( empty( $this->columns_to_save ) ) return true;
@@ -535,8 +554,8 @@ class SimpleORM {
         $caller_funcs_to_ignore = array('get_relation','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
 
         ###  Must be installed and active
-        if ( ! is_null($this->state) && $this->state != 'active' ) {
-            trigger_error( 'Call to get_relation() on a "'. get_class($this) .'" object that is "'. $this->state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+        if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
+            trigger_error( 'Call to get_relation() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
         ###  Return the cached answer if it's there
@@ -552,7 +571,7 @@ class SimpleORM {
 
         ###  Relationship types
         if ( $rel['relationship'] == 'has_one' ) {
-            START_TIMER('SimpleORM get_relationship has_one', SimpleORM_PROFILE);
+            START_TIMER('SimpleORM get_relationship has_one', ORM_SQL_PROFILE);
             ###  Read the 'columns' definition
             $rel_pk_values = array();
             $are_null_values = false;
@@ -560,16 +579,16 @@ class SimpleORM {
             else                                                                   { if (( $rel_pk_values[] = $this->get($rel['columns']) ) === null) $are_null_values = true; }
         
             ###  Can't do this type with NULL values
-            if ( $are_null_values ) { END_TIMER('SimpleORM get_relationship has_one', SimpleORM_PROFILE);  return null; }
+            if ( $are_null_values ) { END_TIMER('SimpleORM get_relationship has_one', ORM_SQL_PROFILE);  return null; }
 
-            include_once($rel['include']);
             $class = $rel['class'];
+            if ( ! class_exists($class) ) require_once( $this->include_prefix() . $rel['include']);
 
             $this->relation_data[$name] = new $class ($rel_pk_values);
-            END_TIMER('SimpleORM get_relationship has_one', SimpleORM_PROFILE);
+            END_TIMER('SimpleORM get_relationship has_one', ORM_SQL_PROFILE);
         }
         else if ( $rel['relationship'] == 'has_many' ) {
-            START_TIMER('SimpleORM get_relationship has_many', SimpleORM_PROFILE);
+            START_TIMER('SimpleORM get_relationship has_many', ORM_SQL_PROFILE);
             
             ###  Read the 'foreign_key_columns' definition
             $rel_pk_values = array();
@@ -591,8 +610,8 @@ class SimpleORM {
                       "; # " DUMB emacs PHP syntax hiliting
             $sth = dbh_query_bind($sql, $values);
 
-            include_once($rel['include']);
             $class = $rel['class'];
+            if ( ! class_exists($class) ) require_once($this->include_prefix() . $rel['include']);
 
             ###  Get the data and convert it into an array of objects...
             $data = $sth->fetchAll(PDO::FETCH_ASSOC);
@@ -604,10 +623,10 @@ class SimpleORM {
 
             $this->relation_data[$name] = $obj_list;
 
-            END_TIMER('SimpleORM get_relationship has_many', SimpleORM_PROFILE);
+            END_TIMER('SimpleORM get_relationship has_many', ORM_SQL_PROFILE);
         }
         else if ( $rel['relationship'] == 'many_to_many' ) {
-            START_TIMER('SimpleORM get_relationship many_to_many', SimpleORM_PROFILE);
+            START_TIMER('SimpleORM get_relationship many_to_many', ORM_SQL_PROFILE);
             
             ###  Read the 'foreign_key_columns' definition
             $rel_pk_values = array();
@@ -637,8 +656,8 @@ class SimpleORM {
                       "; # " DUMB emacs PHP syntax hiliting
             $sth = dbh_query_bind($sql, $values);
 
-            include_once($rel['include']);
             $class = $rel['class'];
+            if ( ! class_exists($class) ) require_once($this->include_prefix() . $rel['include']);
 
             ###  Get the data and convert it into an array of objects...
             $data = $sth->fetchAll(PDO::FETCH_ASSOC);
@@ -650,7 +669,7 @@ class SimpleORM {
 
             $this->relation_data[$name] = $obj_list;
 
-            END_TIMER('SimpleORM get_relationship many_to_many', SimpleORM_PROFILE);
+            END_TIMER('SimpleORM get_relationship many_to_many', ORM_SQL_PROFILE);
         }
         else {
             ###  Error if they use an invalid relationship type
@@ -838,13 +857,13 @@ class SimpleORM {
         $caller_funcs_to_ignore = array('create','exists','call_user_func_array','do_object_forward_method');
     
         ###  Must be not installed
-        if ( $this->exists() || $this->state != 'not_created' ) {
-            trigger_error( 'Call to create() on a "'. get_class($this) .'" object that is "'. $this->state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+        if ( $this->exists() || $this->obj_state != 'not_created' ) {
+            trigger_error( 'Call to create() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
 
         ###  Check in advance that we will be able to get the new Primary Key values...
-        if ( $this->db_type == 'pg' ) {
+        if ( $this->dbh_type == 'pg' ) {
             foreach ($this->primary_key as $col) {
                 if ( ! isset($to_set[$col]) && ! isset($this->column_sequences[$col]) ) {
                     trigger_error( 'In create, could not proceed because I would not be able to get complete primary key after insert.  You probably need to define a "column_sequences" definition in your SimpleORM object'. get_class($this) .'::'. $col . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
@@ -869,10 +888,10 @@ class SimpleORM {
             if ( isset($to_set[$col]) ) {
                 $this->pk_values[$col] = $to_set[$col];
             }
-            else if ( $this->db_type == 'pg' && isset($this->column_sequences[$col]) ) {
+            else if ( $this->dbh_type == 'pg' && isset($this->column_sequences[$col]) ) {
                 $this->pk_values[$col] = $this->dbh->lastInsertId($this->column_sequences[$col]);
             }
-            else if ( $this->db_type != 'pg' ) {
+            else if ( $this->dbh_type != 'pg' ) {
                 $this->pk_values[$col] = $this->dbh->lastInsertId();
             }
             ###  (PostgreSQL only) Already checking for the 'else' above BEFORE the insert is done...
@@ -880,7 +899,7 @@ class SimpleORM {
                 trigger_error( 'What the?'. get_class($this) .'::'. $col . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             }
         }
-        $this->state = null;
+        $this->obj_state = null;
         
         ###  Add to cache
         $pk_string = array();  foreach ($this->primary_key as $col) { $pk_string[] = $this->pk_values[$col]; }
@@ -915,8 +934,8 @@ class SimpleORM {
         $caller_funcs_to_ignore = array('delete','exists','call_user_func_array','do_object_forward_method');
 
         ###  Must be installed and active
-        if ( ! is_null($this->state) && $this->state != 'active' ) {
-            trigger_error( 'Call to delete() on a "'. get_class($this) .'" object that is "'. $this->state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+        if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
+            trigger_error( 'Call to delete() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
         
@@ -933,7 +952,7 @@ class SimpleORM {
 
         ###  Reset any data beside the PK values
         unset($this->data, $this->dbh, $this->columns_to_save );
-        $this->state = 'deleted';
+        $this->obj_state = 'deleted';
 
         if ( ! $this->post_delete_handler() ) return false;
         
@@ -981,7 +1000,7 @@ class SimpleORM {
         return call_user_func_array(array(&$this->object_forward, $method_name), $trace[1]['args']);
     }
 
-    
+
     #########################
     ###  Validation
 
@@ -1017,17 +1036,7 @@ class SimpleORM {
      * included in the column names list.
      *
      */
-    public function extract(&$form = null) {
-        if ( is_null($form) ) $form = &$_REQUEST;
-        $cols = array_slice( func_get_args(), 1 );
-        $prefix = '';
-        if ( count( $cols ) == 1 && is_array(array_shift(array_values($cols))) ) { $cols = array_shift(array_values($cols)); };
-        if ( count( $cols ) == 2 && is_array(array_shift(array_values($cols)))
-             &&                   ! is_array(array_pop(  array_values($cols))) ) { $prefix = array_pop(array_values($cols));  $cols = array_shift(array_values($cols)); };
-        
-        $ret_array = array();  foreach ($cols as $col) { if (isset($form[$prefix.$col])) $ret_array[$prefix.$col] = $form[$prefix.$col]; }
-        return $ret_array;
-    }
+    public function extract(&$form = null) { $tmp = func_get_args();  return call_user_func_array( 'form_extract', $tmp ); }
 
     /**
      * validate() - Take an assoc array, validate all parameters, and return good values, status and errors
@@ -1062,24 +1071,8 @@ class SimpleORM {
      *
      */
     public function validate(&$form = null) {
-        if ( is_null($form) ) $form = &$_REQUEST;
-        $cols = array_slice( func_get_args(), 1 );
-        $prefix = '';
-        if ( count( $cols ) == 1 && is_array(array_shift(array_values($cols))) ) { $cols = array_shift(array_values($cols)); };
-        if ( count( $cols ) == 2 && is_array(array_shift(array_values($cols)))
-             &&                   ! is_array(array_pop(  array_values($cols))) ) { $prefix = array_pop(array_values($cols));  $cols = array_shift(array_values($cols)); };
-        
-        $to_set = array();  $errors = array();
-        $all_ok = true;
-        foreach ($cols as $col) {
-            list($ok, $scrubbed_value, $col_errors) = $this->validate_column_value($col, (isset($form[$prefix.$col]) ? $form[$prefix.$col] : null), $prefix );
-            if ( ! $ok ) {
-                $errors[$prefix.$col] = $col_errors;
-                $all_ok = false;
-            }
-            else { $to_set[$col] = $scrubbed_value; }
-        }
-        return array( $to_set, $all_ok, $errors );
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        $tmp = func_get_args();  $tmp[] = $this->schema;  return call_user_func_array( 'validate', $tmp );
     }
 
     /**
@@ -1097,16 +1090,8 @@ class SimpleORM {
      * @param mixed  $value   The value to be tested
      */
     public function extract_and_validate(&$form = null) {
-        if ( is_null($form) ) $form = &$_REQUEST;
-        $cols = array_slice( func_get_args(), 1 );
-        $prefix = '';
-        if ( count( $cols ) == 1 && is_array(array_shift(array_values($cols))) ) { $cols = array_shift(array_values($cols)); };
-        if ( count( $cols ) == 2 && is_array(array_shift(array_values($cols)))
-             &&                   ! is_array(array_pop(  array_values($cols))) ) { $prefix = array_pop(array_values($cols));  $cols = array_shift(array_values($cols)); };
-        
-        $extracted = $this->extract($form, $cols, $prefix);
-        list($to_set, $all_ok, $errors) = $this->validate($extracted, $cols, $prefix);
-        return array( $to_set, $all_ok, $errors );
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        $tmp = func_get_args();  $tmp[] = $this->schema;  return call_user_func_array( 'extract_and_validate', $tmp );
     }
 
     /**
@@ -1119,14 +1104,431 @@ class SimpleORM {
      */
     public function validate_column_value($col, $value) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
-
-        ###  Error out if not in schema
-        if ( ! isset( $this->schema[ $col ] ) || ! is_array( $this->schema[ $col ] ) ) {
-            ###  Error if they use an invalid relationship type
-            trigger_error( 'Call to validate invalid column '. get_class($this) .'::'. $col . ' in '. trace_blame_line(array('validate','extract_and_validate')), E_USER_ERROR);
-            return null;
-        }
-        
-        return do_validation( $col, $value, $this->schema[ $col ] );
+        return validate_column_value($col, $value, $this->schema);
     }
 }
+
+
+/**
+ * validation.inc.php
+ * 
+ * This file contains data validation routines, especially for use by the {@link SimpleORM} class
+ * @author Dave Buchanan <dave@StarkMVC.com>
+ * @package StarkMVC
+ * @version $Id: SimpleORM.class.php,v 1.5 2010/09/28 21:20:56 dave Exp $
+ */
+
+/**
+ * form_extract() - Just extract the given cols from the form
+ *
+ * Returns 3 params:
+ * <ol>
+ *   <li>an assoc array of JUST the values that passed validation.  Some values might be scrubbed as well, like spaced trimmed if requested.  Use this array to later call {@link set()}.
+ *   <li>boolean, true or false if all the validations passed
+ *   <li>an assoc array of errors where the values is a numeric array in the style of the {@link do_validation()}
+ * </ol>
+ *
+ * There are several variations of calling syntax:
+ * <ol>
+ *   <li>validate($form_to_validate, $col_name_1, $col_name_2, $col_name_3, ...)
+ *   <li>validate($form_to_validate, $array_of_column_names)
+ *   <li>validate($form_to_validate, $array_of_column_names, $col_name_prefix)
+ * </ol>
+ *
+ * If the $form_to_validate is not passed then $_REQUEST is used.
+ *
+ * The $col_name_prefix is used when the assoc key names in
+ * the form have a prefix, and the error assoc array also
+ * needs to use that prefix.  This is common when 2 or more
+ * elements are being edited simiultaneously in one web
+ * interface and the fields of the different entities would
+ * otherwise collide and be mixed (e.g. both a class and an
+ * instructor being edited in the same form and they both
+ * have a 'name' field, you could then prefix all the class
+ * fields with 'class_' and all the instructor fields with
+ * 'inst_'.  Note, that the prefix should NOT be already
+ * included in the column names list.
+ *
+ */
+function form_extract(&$form = null) {
+    if ( is_null($form) ) $form = &$_REQUEST;
+    $cols = array_slice( func_get_args(), 1 );
+    $prefix = '';
+    if ( count( $cols ) == 1 && is_array(array_shift(array_values($cols))) ) { $cols = array_shift(array_values($cols)); };
+    if ( count( $cols ) == 2 && is_array(array_shift(array_values($cols)))
+         &&                   ! is_array(array_pop(  array_values($cols))) ) { $prefix = array_pop(array_values($cols));  $cols = array_shift(array_values($cols)); };
+    
+    $ret_array = array();  foreach ($cols as $col) { if (isset($form[$prefix.$col])) $ret_array[$prefix.$col] = $form[$prefix.$col]; }
+    return $ret_array;
+}
+
+/**
+ * validate() - Take an assoc array, validate all parameters, and return good values, status and errors
+ *
+ * Returns 3 params:
+ * <ol>
+ *   <li>an assoc array of JUST the values that passed validation.  Some values might be scrubbed as well, like spaced trimmed if requested.  Use this array to later call {@link set()}.
+ *   <li>boolean, true or false if all the validations passed
+ *   <li>an assoc array of errors where the values is a numeric array in the style of the {@link do_validation()}
+ * </ol>
+ *
+ * There are several variations of calling syntax:
+ * <ol>
+ *   <li>validate($form_to_validate, $col_name_1, $col_name_2, $col_name_3, ...)
+ *   <li>validate($form_to_validate, $array_of_column_names)
+ *   <li>validate($form_to_validate, $array_of_column_names, $col_name_prefix)
+ * </ol>
+ *
+ * If the $form_to_validate is not passed then $_REQUEST is used.
+ *
+ * The $col_name_prefix is used when the assoc key names in
+ * the form have a prefix, and the error assoc array also
+ * needs to use that prefix.  This is common when 2 or more
+ * elements are being edited simiultaneously in one web
+ * interface and the fields of the different entities would
+ * otherwise collide and be mixed (e.g. both a class and an
+ * instructor being edited in the same form and they both
+ * have a 'name' field, you could then prefix all the class
+ * fields with 'class_' and all the instructor fields with
+ * 'inst_'.  Note, that the prefix should NOT be already
+ * included in the column names list.
+ *
+ */
+function validate(&$form = null) {
+    if ( is_null($form) ) $form = &$_REQUEST;
+    $cols = array_slice( func_get_args(), 1 );
+    $prefix = '';
+    ///  Schema will be an array of arrays as the last param...
+    if ( count( $cols ) > 1
+         && is_array(array_shift(array_values($cols)))
+         && is_array(array_pop(array_shift(array_values($cols))))
+         ) { $schema = array_shift($cols); };
+    if ( count( $cols ) == 1 && is_array(array_shift(array_values($cols))) ) { $cols = array_shift(array_values($cols)); };
+    if ( count( $cols ) == 2 && is_array(array_shift(array_values($cols)))
+         &&                   ! is_array(array_pop(  array_values($cols))) ) { $prefix = array_pop(array_values($cols));  $cols = array_shift(array_values($cols)); };
+    
+    $to_set = array();  $errors = array();
+    $all_ok = true;
+    foreach ($cols as $col) {
+        list($ok, $scrubbed_value, $col_errors) = validate_column_value($col, (isset($form[$prefix.$col]) ? $form[$prefix.$col] : null), $schema );
+        if ( ! $ok ) {
+            $errors[$prefix.$col] = $col_errors;
+            $all_ok = false;
+        }
+        else { $to_set[$col] = $scrubbed_value; }
+    }
+    return array( $to_set, $all_ok, $errors );
+}
+
+/**
+ * extract_and_validate() - Combination function for {@link extract()} and {@link validate()}
+ *
+ * Extracts the values from the form hash passed, and passes
+ * each through the {@link validate()} function and returns
+ * it's output.
+ *
+ * Calling style is exactly the same as either {@link
+ * extract()} or {@link validate()}, including prefix
+ * functionality.
+ *
+ * @param string $col     The column name to validate.  It uses this to read the schema definition and get the criteria
+ * @param mixed  $value   The value to be tested
+ */
+function extract_and_validate(&$form = null) {
+    if ( is_null($form) ) $form = &$_REQUEST;
+    $cols = array_slice( func_get_args(), 1 );
+    $prefix = '';
+    ///  Schema will be an array of arrays as the last param...
+    if ( count( $cols ) > 1
+         && is_array(array_shift(array_values($cols)))
+         && is_array(array_pop(array_shift(array_values($cols))))
+         ) { $schema = array_shift($cols); };
+    if ( count( $cols ) == 1 && is_array(array_shift(array_values($cols))) ) { $cols = array_shift(array_values($cols)); };
+    if ( count( $cols ) == 2 && is_array(array_shift(array_values($cols)))
+         &&                   ! is_array(array_pop(  array_values($cols))) ) { $prefix = array_pop(array_values($cols));  $cols = array_shift(array_values($cols)); };
+    
+    $extracted = form_extract($form, $cols, $prefix);
+    list($to_set, $all_ok, $errors) = validate($extracted, $cols, $prefix, $schema);
+    return array( $to_set, $all_ok, $errors );
+}
+
+/**
+ * validate_column_value() - Single value validations
+ *
+ * Returns the output of {@link do_validation()}.
+ *
+ * @param string $col     The column name to validate.  It uses this to read the schema definition and get the criteria
+ * @param mixed  $value   The value to be tested
+ */
+function validate_column_value($col, $value, $schema) {
+    ###  Error out if not in schema
+    if ( ! isset( $schema[ $col ] ) || ! is_array( $schema[ $col ] ) ) {
+        ###  Error if they use an invalid relationship type
+        trigger_error( 'Call to validate invalid column '. get_class($this) .'::'. $col . ' in '. trace_blame_line(array('validate','extract_and_validate')), E_USER_ERROR);
+        return null;
+    }
+    
+    return do_validation( $col, $value, $schema[ $col ] );
+}
+
+
+/**
+ * Main validation function
+ *
+ * The validation parameters are passed in an assoc array, (often
+ * coming from the schema definition of a {@link SimpleORM}
+ * derived object).
+ *
+ * These are some scrubbing operations:
+ * <ul>
+ *   <li>Default stripping off of leading and trailing whitespace from all values unless the 'no_strip_ws' parameter is passed.
+ *   <li>If the 'format' param is 'decimal' it will strip off any leading '+' chars
+ *   <li>If the 'format' param is 'bool' it will turn all values that are (! isset()) to an actual boolean false value.
+ *   <li>If the 'format' param is 'credit_card_number' it will drop all space and dash ('-') chars
+ *   <li>The 'not_empty_string' param will turn empty string values into an actual NULL value
+ * </ul>
+ * 
+ * These are the different validation types:
+ * <ul>
+ *   <li>The 'required' param is checked first, and if it's present, but the value is not isset(), then it adds an error and returns.  If there is no value, and the 'required' param is not there it will then return success and do no further checks.
+ *   <li>The 'maxlength' and 'minlength' to dtring length checks
+ *   <li>The 'regex' and 'negative_regex' params check if the value passes the given regular expression (or not)
+ *   <li>The 'format' param tests various types including: 'email', 'bool', 'decimal', 'integer', 'date' (UTC), 'datetime' (UTC), 'credit_card' (using LUHN10), 'ip' (v4)
+ *   <li>The 'gt', 'ge', 'lt', 'le' test if the numeric value is greater than, less than, etc...
+ * </ul>
+ * 
+ * If the column value fails, the error format is a numeric array with 2 values:
+ * <ol>
+ *   <li>The error phrased in English (used until we get Language abstraction completed and used as a default as coding continues)
+ *   <li>The error as a more generic code (e.g. 'invalid_regex') that can be used for language abstraction.
+ * </ol>
+ *
+ * The function returns these values:
+ * <ol>
+ *   <li>boolean, true or false if the validation passed
+ *   <li>the (possibly) scrubbed value
+ *   <li>If failure, an array in the above format, if passed, an empty array.
+ * </ol>
+ *
+ * <code>
+ * list($ok, $item_count, $error) = do_validation('item_count',$_REQUEST['item_count'], array( 'name' => "number of items", 'format' => 'integer', 'required' => true ));
+ * if ( ! $ok ) $request->page->add_error('item_count', $error);
+ * </code>
+ *
+ * @param string $col      the name of the data or database column to be validated (used as a default name if none is passed in the $valhash)
+ * @param string $value    value to test
+ * @param string $valhash  an array containing validation parameters
+ * @return mixed
+ */
+function do_validation( $col, $value, array $valhash ) {
+
+    if ( ! empty( $valhash['name'] ) ) $name = ucfirst( $valhash['name'] );
+    if ( empty($name) )                $name = ucfirst( preg_replace('/_/',' ', $col) );
+    
+    ###  Strip off whitespace unless 'no_strip_ws'
+    if (   empty($valhash['no_strip_ws'])                                          &&     isset($value) )  $value = preg_replace('/^\s+|\s+$/','', $value);
+    ###  Strip off optional '+' for format=decimal
+    if ( ! empty($valhash['format']) && $valhash['format'] == 'decimal'            &&     isset($value) )  $value = preg_replace('/^\+/',      '', $value);
+    if ( ! empty($valhash['format']) && $valhash['format'] == 'integer'            &&     isset($value) )  $value = preg_replace('/\.0+$/',    '', $value);
+    if ( ! empty($valhash['format']) && $valhash['format'] == 'bool'               && ( ! isset($value) || preg_match('/^(f|false|n|no|0)$/i', $value) != 0 ) )  $value = false;
+    if ( ! empty($valhash['format']) && $valhash['format'] == 'bool'               &&     isset($value) && preg_match('/^(t|true|y|yes|1)$/i', $value) != 0 )    $value = true;
+    if ( ! empty($valhash['format']) && $valhash['format'] == 'credit_card_number' && (!  empty($value)) ) $value = preg_replace('/[\s\-]/',   '', $value);
+    ###  If 'not_empty_string', then turn into null
+    if ( ! empty($valhash['not_empty_string'])                  && isset($value) && strlen($value) == 0 ) $value = null;
+
+    ###  If there is NO value
+    if ( ! isset( $value ) || $value == '') {
+        ###  Required
+        if    ( ! empty($valhash['required']) 
+            ) { return array( false, $value, array( array($name." is required",'required')) ); }
+    }
+    ###  If there IS a value, validate it...
+    else {
+        ###  Max length
+        if    ( ! empty($valhash['maxlength'])
+                && ( (    ini_get('default_charset') == 'UTF-8' && utf8_strlen($value) > $valhash['maxlength'] ) 
+                     || ( ini_get('default_charset') != 'UTF-8' &&      strlen($value) > $valhash['maxlength'] )
+                     )
+            ) { return array( false, $value, array( array($name." may not be longer than ". $valhash['maxlength'] ." characters",'too_long')) ); }
+        ###  Min length
+        else if ( ! empty($valhash['minlength'])
+                && ( (    ini_get('default_charset') == 'UTF-8' && utf8_strlen($value) < $valhash['minlength'] ) 
+                     || ( ini_get('default_charset') != 'UTF-8' &&      strlen($value) < $valhash['minlength'] )
+                     )
+            ) { return array( false, $value, array( array($name." must be at least ". $valhash['minlength'] ." characters",'too_short')) ); }
+        ###  Regular Expression
+        else if ( ! empty($valhash['regex'])          && preg_match($valhash['regex'],          $value) == 0
+                  ) { return array( false, $value, array( array($name." is not valid". (isset($valhash['regex_advice']) ? ('.  '. $valhash['regex_advice']) : ''),'invalid_regex')) ); }
+        ###  Negative Match Regular Expression
+        else if ( ! empty($valhash['negative_regex']) && preg_match($valhash['negative_regex'], $value) > 0
+                  ) { return array( false, $value, array( array($name." is not valid". (isset($valhash['regex_advice']) ? ('.  '. $valhash['regex_advice']) : ''),'invalid_regex')) ); }
+        ###  Format : email
+        else if ( ! empty($valhash['format'])
+                && $valhash['format'] == 'email'
+                && preg_match('/^[a-z0-9][a-z0-9\._\-\+]*\@([a-z0-9\-]+\.)+[a-z]{2,}$/i', $value) == 0
+            ) { return array( false, $value, array( array($name." is not a valid email address",'invalid_email')) ); }
+        ###  Format : boolean
+        else if ( ! empty($valhash['format'])
+                && $valhash['format'] == 'bool'
+                && preg_match('/^(t|true|y|yes|1|f|false|n|no|0|1)$/i', $value) == 0
+            ) {
+            return array( false, $value, array( array($name." is not a valid boolean value",'invalid_boolean')) );
+        }
+        ###  Format : decimal
+        else if ( ! empty($valhash['format'])
+                && $valhash['format'] == 'decimal'
+                && preg_match('/^\-?(\d+(\.\d+)?|\.\d+)$/', $value) == 0
+            ) { return array( false, $value, array( array($name." is not a valid number",'invalid_decimal')) ); }
+        ###  Format : integer
+        else if ( ! empty($valhash['format'])
+                && $valhash['format'] == 'integer'
+                && preg_match('/^\-?\d+$/', $value) == 0
+            ) { return array( false, $value, array( array($name." is not a valid number",'invalid_integer')) ); }
+        ###  Format : date
+        else if ( ! empty($valhash['format'])
+                && $valhash['format'] == 'date'
+                && ( preg_match('/^\d{4}\-\d{2}\-\d{2}$/', $value) == 0
+                     || strtotime( $value ) === false
+                    )
+            ) { return array( false, $value, array( array($name." is not a valid date",'invalid_date')) ); }
+        ###  Format : datetime
+        else if ( ! empty($valhash['format'])
+                && $valhash['format'] == 'datetime'
+                && ( preg_match('/^\d{4}\-\d{2}\-\d{2}( \d{2}:\d{2}:\d{2})?$/', $value) == 0
+                     || strtotime( $value ) === false
+                    )
+            ) { return array( false, $value, array( array($name." is not a valid date",'invalid_date')) ); }
+        ###  Format : credit_card_number
+        else if ( ! empty($valhash['format'])
+                && $valhash['format'] == 'credit_card_number'
+                && ( preg_match('/^\d{13,16}$/', $value) == 0
+                     || ! luhn_10( $value )
+                    )
+            ) { return array( false, $value, array( array($name." is not a valid credit card number",'invalid_cc_number')) ); }
+        ###  Format : ip
+        else if ( ! empty($valhash['format'])
+                && $valhash['format'] == 'ip'
+                && ( preg_match('/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}?$/', $value) == 0
+                     || ( max( split('.', $value) ) > 255 )
+                    )
+            ) { return array( false, $value, array( array($name." is not a valid IP address",'invalid_ip_address')) ); }
+        ###  Greater Than
+        else if ( ! empty($valhash['gt'])  && $value <= $valhash['gt'] 
+            ) { return array( false, $value, array( array($name." may not be less than or equal to ". $valhash['gt'],'greater_than')) ); }
+        ###  Greater Than or equal To
+        else if ( ! empty($valhash['ge']) && $value < $valhash['ge'] 
+            ) { return array( false, $value, array( array($name." may not be less than ". $valhash['ge'],'greater_than_or_eq')) ); }
+        ###  Less Than
+        else if ( ! empty($valhash['lt'])  && $value >= $valhash['lt'] 
+            ) { return array( false, $value, array( array($name." may not be greater than or equal to ". $valhash['lt'],'less_than')) ); }
+        ###  Less Than or equal To
+        else if ( ! empty($valhash['le']) && $value > $valhash['le'] 
+            ) { return array( false, $value, array( array($name." may not be greater than ". $valhash['le'],'less_than_or_eq')) ); }
+    }
+    
+    return array( true, $value, array() );
+  }
+
+function utf8_strlen($str) {
+  $count = 0;
+  for ($i = 0; $i < strlen($str); ++$i) {
+    if ((ord($str[$i]) & 0xC0) != 0x80) {
+      ++$count;
+    }
+  }
+  return $count;
+}
+
+###  LUHN(10) algorithm
+function luhn_10($cc) {
+    $i = 1;  $s = array();
+    foreach(array_reverse(str_split($cc)) as $c) {
+        $s = array_merge($s, (($i++%2) ? array($c) : str_split($c*2)));
+    }
+    return (array_sum($s) % 10) ? 0 : 1;
+}
+
+### function to check if a given string represents a valid (non 0000-00-00 00:00:00) datetime
+### from http://stackoverflow.com/questions/141315/php-check-for-a-valid-date-wierd-date-conversions
+function is_valid_date_time($dateTime)
+{
+	// preg_match checks that it has all the right parts and that the time part is valid
+	// checkdate checks that the date part is valid
+    if (preg_match("/^(\d{4})-(\d{2})-(\d{2}) ([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])$/", $dateTime, $matches)) {
+        if (checkdate($matches[2], $matches[3], $matches[1])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * dbh_query_bind() - Run a read-only SQL query with bound parameters
+ *
+ * @param string $sql      The SQL query to run
+ * @param mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
+ * @return PDOStatement
+ */
+function dbh_query_bind( $sql ) {
+    if ( isset( $GLOBALS['orm_dbh'] ) ) $use_dbh = $GLOBALS['orm_dbh'];
+    if ( ORM_SQL_PROFILE ) START_TIMER('dbh_query_bind');
+    $bind_params = array_slice( func_get_args(), 1 );
+    ###  Allow params passed in an array or as args
+    if ( is_a( $bind_params[ count($bind_params) - 1 ], 'PDO' ) || is_a( $bind_params[ count($bind_params) - 1 ], 'PhoneyPDO' ) ) $use_dbh = array_pop($bind_params);
+    if ( ! isset( $GLOBALS['orm_dbh'] ) ) $GLOBALS['orm_dbh'] = $use_dbh; # steal their DBH for global use, hehehe
+    if ( count( $bind_params ) == 1 && is_array(array_shift(array_values($bind_params))) ) { $bind_params = array_shift(array_values($bind_params)); };
+#    if (ORM_SQL_DEBUG) trace_dump();
+    reverse_t_bools($bind_params);
+    if (ORM_SQL_DEBUG) bug($sql, $bind_params);
+    try { 
+        $sth = $use_dbh->prepare($sql);
+        $rv = $sth->execute($bind_params);
+    } catch (PDOException $e) {
+        trace_dump();
+        $err_msg = 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line();
+        if ( strlen($err_msg) > 1024 ) {
+            bug($err_msg,$sql,$bind_params,$e->getMessage());
+            $sql = substr($sql,0,1020 + strlen($sql) - strlen($err_msg) ).'...';
+        }
+        trigger_error( 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line(), E_USER_ERROR);
+        return false;
+    }
+    if ( ORM_SQL_PROFILE ) END_TIMER('dbh_query_bind');
+    return $sth;
+}
+/**
+ * dbh_do_bind() - Execute a (possibly write access) SQL query with bound parameters
+ *
+ * @param string $sql      The SQL query to run
+ * @param mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
+ * @return PDOStatement
+ */
+function dbh_do_bind( $sql ) {
+    if ( isset( $GLOBALS['orm_dbh'] ) ) $use_dbh = $GLOBALS['orm_dbh'];
+    if ( ORM_SQL_PROFILE ) START_TIMER('dbh_do_bind');
+    $bind_params = array_slice( func_get_args(), 1 );
+    ###  Allow params passed in an array or as args
+    if ( is_a( $bind_params[ count($bind_params) - 1 ], 'PDO' ) || is_a( $bind_params[ count($bind_params) - 1 ], 'PhoneyPDO' ) ) $use_dbh = array_pop($bind_params);
+    if ( ! isset( $GLOBALS['orm_dbh'] ) ) $GLOBALS['orm_dbh'] = $use_dbh; # steal their DBH for global use, hehehe
+    if ( count( $bind_params ) == 1 && is_array(array_shift(array_values($bind_params))) ) { $bind_params = array_shift(array_values($bind_params)); };
+    
+    reverse_t_bools($bind_params);
+    if (ORM_SQL_DEBUG || ORM_SQL_WRITE_DEBUG) bug($sql, $bind_params);
+    try { 
+        $sth = $use_dbh->prepare($sql);
+        $rv = $sth->execute($bind_params);
+    } catch (PDOException $e) {
+        trace_dump();
+        $err_msg = 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line();
+        if ( strlen($err_msg) > 1024 ) {
+            bug($err_msg,$sql,$bind_params,$e->getMessage());
+            $sql = substr($sql,0,1020 + strlen($sql) - strlen($err_msg) ).'...';
+        }
+        trigger_error( 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line(), E_USER_ERROR);
+        return false;
+    }
+    if ( ORM_SQL_PROFILE ) END_TIMER('dbh_do_bind');
+    return $rv;
+}
+function reverse_t_bools(&$ary) { if (! is_array($ary)) return;  foreach($ary as $k => $v) { if ($v === true) $ary[$k] = 't';  if ($v === false) $ary[$k] = 'f'; } }
