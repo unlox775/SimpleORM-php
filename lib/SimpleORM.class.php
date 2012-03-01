@@ -75,7 +75,7 @@ $GLOBALS['SimpleORM_OBJECT_CACHE'] = array();
  *             $class_enrollment->cancelled = true;
  *             $class_enrollment->save(); # also could have used set_and_save() to do in one step...
  *         }
- *         $this->set_and_save(array('status','expelled'));
+ *         $this->set_and_save(array('status' => 'expelled'));
  *     }
  * }
  *
@@ -312,7 +312,7 @@ class SimpleORM {
         }
     }
     ///  Wait as late as possible to get the DBH...
-    private function load_dbh() {
+    protected function load_dbh() {
         ###  Get the database handle
         if ( is_null( $this->dbh ) ) {
             $this->dbh      =& $this->provide_dbh();
@@ -470,6 +470,10 @@ class SimpleORM {
         
         ###  Set the new values in $this->data
         foreach (array_keys($to_set) as $col) {
+            ###   If on the first edit they want to remember the OLD values, then DO...
+            if ( $this->remember_old_values() && ! $this->columns_to_save[ $col ] ) {
+                $this->data['__old__'][ $col ] = $this->data[ $col ];
+            }
             $this->columns_to_save[ $col ] = true;
             $this->data[ $col ] = $to_set[ $col ];
         }
@@ -477,6 +481,7 @@ class SimpleORM {
         END_TIMER('SimpleORM set', ORM_SQL_PROFILE);
         return true;
     }
+    public function remember_old_values() { return false; }
     /** 
      * unsaved_columns() - Get a quick list of the cols that have been locally {@link set()}, but not yet saved using {@link save()}
      */
@@ -530,6 +535,7 @@ class SimpleORM {
         
         ###  Reset the to-be-saved queue
         $this->columns_to_save = array();
+        if ( isset( $this->data['__old__'] ) ) unset( $this->data['__old__'] );
         
         return true;
     }
@@ -549,7 +555,7 @@ class SimpleORM {
     /**
      * get_relation() - Directly get a relation, can also be done with get()
      */
-    public function get_relation($name) {
+    public function get_relation($name, $force_ordered_list = true) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         $caller_funcs_to_ignore = array('get_relation','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
 
@@ -559,7 +565,7 @@ class SimpleORM {
             return false;
         }
         ###  Return the cached answer if it's there
-        if ( isset( $this->relation_data[$name] ) ) return $this->relation_data[$name];
+        if ( isset( $this->relation_data[$name] ) ) return( $force_ordered_list && is_array( $this->relation_data[$name] ) ? array_values( $this->relation_data[$name] ) : $this->relation_data[$name] );
 
         ###  Must have a definition
         if ( ! array_key_exists($name, $this->relations) ) {
@@ -677,7 +683,8 @@ class SimpleORM {
             return null;
         }
         
-        return $this->relation_data[$name];
+        ///  Force Ordered array, to hide the 'many_to_many' keyed indexes except when (we) or others want them
+        return( $force_ordered_list && is_array( $this->relation_data[$name] ) ? array_values( $this->relation_data[$name] ) : $this->relation_data[$name] );
     }
     /**
      * has_relation() - for many_to_many relationships only, see if two objects are related
@@ -687,7 +694,7 @@ class SimpleORM {
      */
     public function has_relation($relation, $pkey) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
-        $caller_funcs_to_ignore = array('get_relation','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
+        $caller_funcs_to_ignore = array('set_complete_relation', 'get_relation','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
         ###  Must be many to many
         if ( $this->relations[$relation]['relationship'] != 'many_to_many' )  {
             trigger_error( 'Call to has_relation() when not a many_to_many '. get_class($this) .'::'. $name . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
@@ -696,7 +703,7 @@ class SimpleORM {
 
         $relation_key = is_array($pkey)?join('||--||',$pkey):$pkey;
 
-        return array_key_exists($relation_key,$this->get_relation($relation));
+        return array_key_exists($relation_key,$this->get_relation($relation, false));
     }
     /**
      * add_relation() - 
@@ -770,7 +777,16 @@ class SimpleORM {
         ###  Assemble the SQL, (either UDPATE or DELETE)
         if ( is_null( $this->dbh ) ) $this->load_dbh();
         if ( isset($rel['change_status_instead_of_delete']) && $rel['change_status_instead_of_delete'] ) {
-            $sql = "UPDATE ". $rel['join_table'] ." SET status = 'inactive', inactive_date = now()";
+            $sql = "UPDATE ". $rel['join_table'] ."
+                       SET status = '". ( ( is_string($rel['change_status_instead_of_delete']) && $rel['change_status_instead_of_delete'] != '1' )
+				                          ? $rel['change_status_instead_of_delete']
+				                          : 'inactive'
+				                          ) ."'
+                       ". ( isset($rel['update_inactive_date'] )
+							? ', '. ( ( is_string($rel['update_inactive_date']) && $rel['update_inactive_date'] != '1' ) ? $rel['update_inactive_date'] : 'inactive_date' ) .' = now()'
+							: ''
+							) ."
+                      ";
             $where[] = "status = 'active'";
         } else {
             $sql = "DELETE FROM ". $rel['join_table'];
@@ -794,7 +810,7 @@ class SimpleORM {
         ###  This call is expensive enough, clear relation cache before to assure reliability...
         unset($this->relation_data[$relation]);
         
-        $old_relations = $this->get_relation($relation);
+        $old_relations = $this->get_relation($relation, false);
         foreach($pkeys as $pkey) {
             $relation_key = is_array($pkey)?join('||--||',$pkey):$pkey;
             ##  Skip ones already set and in to_set
@@ -973,6 +989,177 @@ class SimpleORM {
      */
     protected function post_delete_handler() { return true; }
 
+
+
+    ########################
+    ###  Pre-Cache Sub-Relations
+    
+    ###  Need to expose some internals for this..
+    protected function __relations() { if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();  return $this->relations; }
+    protected function __schema()    { if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();  return $this->schema; }
+
+    /**
+     * pre_load_sub_relations() - Acts like get_relation(), but pre-load sub-object's in one query (for "has_many" relations only)
+     *
+     * This will return just like get_relation() except that first it will create a Monster query
+     * to join in a bunch of other tables so it can pre-load them all at once.  NOTE: this will
+     * spin many nested levels deep looking for "has_one" relationships.  But it will only pre-load
+     * "has_one" relationships (using an OUTER JOIN).
+     *
+     * NOTE: The "where_clause" in your "has_many" relationship will be used in this new Monster query
+     * which also will have lots of other tables joined in.  If some of these joined in tables have the
+     * same column names as your primary table, then it's possible that some of the coluns you reference
+     * in your "where_clause" may become ambiguous references.  To avoid this, it's best to just prefix
+     * all column names in your "has_many" relation's "where_clause" with the full table name as the alias.
+     *
+     */
+    public function pre_load_sub_relations( $name, $sub_relations_to_load, $force_ordered_list = true ) {
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        $caller_funcs_to_ignore = array('pre_load_sub_relations','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
+
+        ###  Must be installed and active
+        if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
+            trigger_error( 'Call to pre_load_sub_relations() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+            return false;
+        }
+        ###  DON'T RETURN a CACHED ANSWER, Re-Run every time...
+#        if ( isset( $this->relation_data[$name] ) ) return( $force_ordered_list && is_array( $this->relation_data[$name] ) ? array_values( $this->relation_data[$name] ) : $this->relation_data[$name] );
+
+        ###  Must have a definition
+        if ( ! array_key_exists($name, $this->relations) ) {
+            trigger_error( 'Use of invalid relation '. get_class($this) .'::'. $name . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+            return false;
+        }
+
+        $rel = &$this->relations[$name];
+
+        ###  Must have a definition
+        if ( $rel['relationship'] != 'has_many' ) {
+            trigger_error( 'Call to pre_load_sub_relations() on a relation that is not "has_many": '. get_class($this) .'::'. $name . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+            return false;
+        }
+
+        START_TIMER('SimpleORM get_relationship has_many (pre_load_sub)', ORM_SQL_PROFILE);
+            
+        ###  Read the 'foreign_key_columns' definition
+        $rel_pk_values = array();
+        $are_null_values = false;
+        if ( is_array($rel['foreign_key_columns']) ) { $fk_columns =        $rel['foreign_key_columns']; }
+        else                                         { $fk_columns = array( $rel['foreign_key_columns'] ); }
+
+        if ( is_array($rel['foreign_table_pkey']) ) { $foreign_pkey =        $rel['foreign_table_pkey']; }
+        else                                        { $foreign_pkey = array( $rel['foreign_table_pkey'] ); }
+            
+        if ( is_null( $this->dbh ) ) $this->load_dbh();
+
+        $class = $rel['class'];
+        if ( ! class_exists($class) ) require_once($this->include_prefix() . $rel['include']);
+
+        $alias = $rel['foreign_table'];
+        $seen = array(get_class($this)); // Don't crawl back to THIS object...
+        $sub_tables = array( 'alias_letters' => range('a','z'),
+                             'aliases' => array( 'primary' => $class ),
+                             'pkeys'   => array( 'primary' => ( is_array( $this->primary_key ) ? $this->primary_key : array( $this->primary_key ) ) ),
+                             'joins'   => array( "FROM ". $rel['foreign_table'] ),
+                             'selects' => array( $alias .'.*' ),
+                             );
+        $this->get_pre_load_sub_relations($class, $alias, $sub_relations_to_load, $seen, $sub_tables);
+
+        $values = array();
+        $where = array();  foreach ($fk_columns as $i => $col) { $where[] = "$alias.$col = ?";  $values[] = $this->pk_values[$this->primary_key[$i]]; }
+        if ( ! empty($rel['custom_where_clause']) ) $where[] = $rel['custom_where_clause'];
+
+        $sql = "SELECT ". join(',',$sub_tables['selects']) ."
+                  ". join("\n         ",$sub_tables['joins']) ."
+                 ". ((! empty($where)                  ) ? "WHERE ". join(' AND ', $where)      : "") ."
+                 ". ((! empty($rel['order_by_clause']) ) ? "ORDER BY ". $rel['order_by_clause'] : "") ."
+                  "; # " DUMB emacs PHP syntax hiliting
+        if (ORM_SQL_DEBUG) trace_dump();
+        if (ORM_SQL_DEBUG) bug($sql, $values);
+        $sth = dbh_query_bind($sql, $values);
+
+
+        ###  Get the data and convert it into an array of objects...
+        $data = $sth->fetchAll(PDO::FETCH_ASSOC);
+
+
+        $obj_list = array();
+        foreach ( $data as $row ) {
+
+            ###  Split data into groups
+            $groups = array();
+            foreach ( array_keys($row) as $col ) {
+                if ( strpos($col, '___') === false ) $groups['primary'][$col] = $row[$col];
+                else {
+                    list($alias,$acol) = explode('___', $col);
+                    $groups[ $alias ][$acol] = $row[$col];
+                }
+            }
+            
+            foreach ( $groups as $alias => $grow ) {
+                /// Skip if the PKey is null
+                $any_pkeys_were_null = false;
+                $pkey_vals = array();
+                foreach ($sub_tables['pkeys'][$alias] as $col) {
+                    if ( is_null($grow[$col]) ) { $any_pkeys_were_null = true; }
+                    else { $pkey_vals[] = $grow[$col]; } 
+                }
+                if ( $any_pkeys_were_null ) continue; 
+
+                $g_class = $sub_tables['aliases'][$alias];
+                $obj = new $g_class ($pkey_vals,$grow);
+
+                ###  If this is the Primary table, then add it to the object list
+                ###    ( otherwise, we have pre-loaded the object, and we're done)
+                if ( $alias == 'primary' ) $obj_list[] = $obj;
+            }
+        }
+
+        $this->relation_data[$name] = $obj_list;
+
+        END_TIMER('SimpleORM get_relationship has_many (pre_load_sub)', ORM_SQL_PROFILE);
+        
+        ###  Force Ordered array, to hide the 'many_to_many' keyed indexes except when (we) or others want them
+        return( $force_ordered_list && is_array( $this->relation_data[$name] ) ? array_values( $this->relation_data[$name] ) : $this->relation_data[$name] );
+    }
+
+    ###  Nested loop to find all has_one relations
+    protected function get_pre_load_sub_relations($class, $alias, $sub_relations_to_load, &$seen, &$sub_tables, $obj = null) {
+        $seen[] = $class;
+
+        ###  Get a blank object
+        if ( is_null( $obj ) ) $obj = new $class ();
+        foreach ( $obj->__relations() as $name => $rel ) {
+            if ( $rel['relationship'] != 'has_one'
+                 || ! in_array( $name, $sub_relations_to_load )
+                 ) continue;
+
+            $sub_class = $rel['class'];
+            if ( ! class_exists($sub_class) ) require_once($this->include_prefix() . $rel['include']);
+            $sub_obj = new $sub_class ();
+
+            ###  Record what we need to Join this table and get it's columns
+            $sub_alias = str_repeat( array_shift( $sub_tables['alias_letters'] ), 4 );
+            $sub_tables['aliases'][ $sub_alias ] = $sub_class;
+
+
+            $local_pkey   = $rel['columns'];              if ( ! is_array($local_pkey) )   $local_pkey   = array( $local_pkey );
+            $foreign_pkey = $sub_obj->get_primary_key();  if ( ! is_array($foreign_pkey) ) $foreign_pkey = array( $foreign_pkey );
+            $on_clause = array();  foreach ( $local_pkey as $i => $col ) $on_clause[] = ( $alias .'.'. $local_pkey[$i] .' = '. $sub_alias .'.'. $foreign_pkey[$i] );
+            $sub_tables['joins'][] = 'LEFT OUTER JOIN '. $sub_obj->get_table() .' '. $sub_alias .' ON ('. $alias .'.'. $rel['columns'] .' = '. $sub_alias .'.'. $foreign_pkey[0] .')';
+
+            $select_cols = array(); foreach ( array_keys( $sub_obj->__schema() ) as $col ) $select_cols[] = ( $sub_alias .'.'. $col .' as '. $sub_alias .'___'. $col );
+            $sub_tables['selects'][] = join(',',$select_cols);
+
+            $sub_tables['pkeys'][ $sub_alias ] = $foreign_pkey;
+
+            ###  Nest Deeper
+            if ( ! in_array( $sub_class, $seen ) ) { ###  Stop infinite loops...
+                $this->get_pre_load_sub_relations($sub_class, $sub_alias,  $sub_relations_to_load, $seen, $sub_tables, $sub_obj);
+            }
+        }
+    }
+
     
     #########################
     ###  Virtual members for getting / setting each column name
@@ -1036,7 +1223,7 @@ class SimpleORM {
      * included in the column names list.
      *
      */
-    public function extract(&$form = null) { $tmp = func_get_args();  return call_user_func_array( 'form_extract', $tmp ); }
+    public function extract($form = null) { $tmp = func_get_args();  return call_user_func_array( 'form_extract', $tmp ); }
 
     /**
      * validate() - Take an assoc array, validate all parameters, and return good values, status and errors
@@ -1070,7 +1257,7 @@ class SimpleORM {
      * included in the column names list.
      *
      */
-    public function validate(&$form = null) {
+    public function validate($form = null) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         $tmp = func_get_args();  $tmp[] = $this->schema;  return call_user_func_array( 'validate', $tmp );
     }
@@ -1089,7 +1276,7 @@ class SimpleORM {
      * @param string $col     The column name to validate.  It uses this to read the schema definition and get the criteria
      * @param mixed  $value   The value to be tested
      */
-    public function extract_and_validate(&$form = null) {
+    public function extract_and_validate($form = null) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         $tmp = func_get_args();  $tmp[] = $this->schema;  return call_user_func_array( 'extract_and_validate', $tmp );
     }
@@ -1150,7 +1337,7 @@ class SimpleORM {
  * included in the column names list.
  *
  */
-function form_extract(&$form = null) {
+function form_extract($form = null) {
     if ( is_null($form) ) $form = &$_REQUEST;
     $cols = array_slice( func_get_args(), 1 );
     $prefix = '';
@@ -1194,15 +1381,20 @@ function form_extract(&$form = null) {
  * included in the column names list.
  *
  */
-function validate(&$form = null) {
+function validate($form = null) {
     if ( is_null($form) ) $form = &$_REQUEST;
     $cols = array_slice( func_get_args(), 1 );
     $prefix = '';
     ///  Schema will be an array of arrays as the last param...
     if ( count( $cols ) > 1
-         && is_array(array_shift(array_values($cols)))
-         && is_array(array_pop(array_shift(array_values($cols))))
-         ) { $schema = array_shift($cols); };
+         && is_array(array_pop(array_values($cols)))
+         && is_array(array_shift(array_pop(array_values($cols))))
+         ) { $schema = array_pop($cols); }
+    else {
+        ###  Error if they didn't pass a schema
+        trigger_error( 'No schema passed as last argument to validate() in '. trace_blame_line(array('validate','extract_and_validate')), E_USER_ERROR);
+        return null;
+    }
     if ( count( $cols ) == 1 && is_array(array_shift(array_values($cols))) ) { $cols = array_shift(array_values($cols)); };
     if ( count( $cols ) == 2 && is_array(array_shift(array_values($cols)))
          &&                   ! is_array(array_pop(  array_values($cols))) ) { $prefix = array_pop(array_values($cols));  $cols = array_shift(array_values($cols)); };
@@ -1234,15 +1426,20 @@ function validate(&$form = null) {
  * @param string $col     The column name to validate.  It uses this to read the schema definition and get the criteria
  * @param mixed  $value   The value to be tested
  */
-function extract_and_validate(&$form = null) {
+function extract_and_validate($form = null) {
     if ( is_null($form) ) $form = &$_REQUEST;
     $cols = array_slice( func_get_args(), 1 );
     $prefix = '';
     ///  Schema will be an array of arrays as the last param...
     if ( count( $cols ) > 1
-         && is_array(array_shift(array_values($cols)))
-         && is_array(array_pop(array_shift(array_values($cols))))
-         ) { $schema = array_shift($cols); };
+         && is_array(array_pop(array_values($cols)))
+         && is_array(array_shift(array_pop(array_values($cols))))
+         ) { $schema = array_pop($cols); }
+    else {
+        ###  Error if they didn't pass a schema
+        trigger_error( 'No schema passed as last argument to extract_and_validate() in '. trace_blame_line(array('validate','extract_and_validate')), E_USER_ERROR);
+        return null;
+    }
     if ( count( $cols ) == 1 && is_array(array_shift(array_values($cols))) ) { $cols = array_shift(array_values($cols)); };
     if ( count( $cols ) == 2 && is_array(array_shift(array_values($cols)))
          &&                   ! is_array(array_pop(  array_values($cols))) ) { $prefix = array_pop(array_values($cols));  $cols = array_shift(array_values($cols)); };
@@ -1264,7 +1461,7 @@ function validate_column_value($col, $value, $schema) {
     ###  Error out if not in schema
     if ( ! isset( $schema[ $col ] ) || ! is_array( $schema[ $col ] ) ) {
         ###  Error if they use an invalid relationship type
-        trigger_error( 'Call to validate invalid column '. get_class($this) .'::'. $col . ' in '. trace_blame_line(array('validate','extract_and_validate')), E_USER_ERROR);
+        trigger_error( 'Call to validate invalid column '. $col . ' in '. trace_blame_line(array('validate','extract_and_validate')), E_USER_ERROR);
         return null;
     }
     
