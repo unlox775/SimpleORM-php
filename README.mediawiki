@@ -1,0 +1,730 @@
+SimpleORM Class, for simple-as-possible Object-to-Relational Mapping (for PostgreSQL, MySQL and SQLite)
+
+== Example usage ==
+
+<pre>
+class SimpleORM__DBHProvider extends SimpleORM {
+    protected function provide_dbh()      { return get_global_dbh_from_wherever(); }
+    protected function provide_dbh_type() { return 'pg'; } // or 'mysql' or 'sqlite'
+    protected function include_prefix()   { return ''; } // or '/path/to/lib';
+}
+class MyStudent extends SimpleORM__DBHProvider {
+    protected $table       = 'student';
+    protected $primary_key = array( 'student_id' );
+    protected $column_sequences = array( 'student_id' => 'student_student_id_seq' );
+    protected $schema = array( 'student_id'  => array(),
+                               'name'           => array( 'maxlength' => 25, 'required' => true ),
+                               'email'          => array( 'format' => 'email', 'maxlength' => 100, 'required' => true ),
+                               'homepage_url'   => array( 'maxlength' => 100, 'regex' => '/^http:\/\//' ),
+                               'mentor_id'      => array(),
+                               'status'         => array(),
+                               'creation_date'  => array(), # a database-side default will auto fill this in...
+        );
+    protected $relations = array(
+        'mentor' => array( 'relationship' => 'has_one',                 
+                           'include'      => 'model/Teacher.class.php', # A file to require_once(), (should be in include_path)
+                           'class'        => 'Teacher',                 # The class name
+                           'columns'      => 'mentor_id',               # local cols to get the PKey for the new object (can be array if >1 col..)
+            ),
+        'classes' => array( 'relationship'      => 'has_many',
+                          'include'             => 'model/Class/Student.class.php', # A file to require_once(), (should be in include_path)
+                          'class'               => 'Class__Student',                # The class name
+                          'foreign_table'       => 'class_student',                 # The table to SELECT FROM
+                          'foreign_key_columns' => 'student_id',                    # The cols in the foreign table that correspond to Your PKey (can be array if >1 col..)
+                          'foreign_table_pkey'  => array('class_id','student_id'),  # The primary key of that table                              (can be array if >1 col..)
+                          'custom_where_clause' => "cancelled IS NOT NULL",         # special condition (other than the FKey column join)
+                          'order_by_clause'     => 'course_name',                   # custom sorting (saves local sorting cost)
+            ),
+        'friends'=> array( 'relationship'                    => 'many_to_many',
+                           'include'                         => 'model/MyStudent.class.php',    # A file to require_once(), (should be in include_path)
+                           'class'                           => 'MyStudent',                    # The class name (NOTE: can be THIS class)
+                           'foreign_table'                   => 'student',                      # The final table of the object we will be getting
+                           'join_table'                      => 'student_peer',                 # The in-between table that has both pKeys
+                           'foreign_table_pkey'              => 'student_id',                   # The pKey of the final table (NOTE: can be THIS table's pKey)
+                           'change_status_instead_of_delete' => false,                          # OPTIONAL: Instead of delete, set "status" and "inactive_date" columns (requires you add these cols)
+                           'join_table_fixed_values'         => array('peer_type' => 'friend'), # OPTIONAL: Alwyas set (and assume to be set) these cols.  Allows for multi-use of the same table    
+                           'order_by_clause'                 => 'name',                         # custom sorting (fields of both the join (jt.) and foreign table (ft.) are valid)
+                           ),
+        'enemies'=> array( 'relationship'                    => 'many_to_many',
+                           'include'                         => 'model/MyStudent.class.php',    # A file to require_once(), (should be in include_path)
+                           'class'                           => 'MyStudent',                    # The class name (NOTE: can be THIS class)
+                           'foreign_table'                   => 'student',                      # The final table of the object we will be getting
+                           'join_table'                      => 'student_peer',                 # The in-between table that has both pKeys
+                           'foreign_table_pkey'              => 'sst_fr_id',                    # The pKey of the final table (note: can be THIS table's pKey)
+                           'change_status_instead_of_delete' => false,                          # OPTIONAL: Instead of delete, set "status" and "inactive_date" columns (requires you add these cols)
+                           'join_table_fixed_values'         => array('peer_type' => 'enemy'),  # OPTIONAL: Alwyas set (and assume to be set) these cols.  Allows for multi-use of the same table
+                           'order_by_clause'                 => 'name',                         # custom sorting (fields of both the join (jt.) and foreign table (ft.) are valid)
+                           ),
+    );
+
+    public function expell($reason) {
+        foreach ($this->classes as $class_enrollment) {
+
+            ###  Set, locally saved in the object.  Nothing sent to the database yet
+            ###     this is the same as calling ->set( array( 'cancelled' => true ) )
+            $class_enrollment->cancelled = true;
+
+            ###  Now, we save the change to the cancelled column to the database
+            ###      also, we could have used ->set_and_save( array( 'cancelled' => true ) ) to do this in one step...
+            $class_enrollment->save();
+
+        }
+        $this->set_and_save(array('status' => 'expelled'));
+    }
+}
+
+###  New student
+$newstud = MyStudent();                                                                        # object status = 'not_created'
+
+###  Inserts new row into database
+$newstud->create(array('name' => 'Bob Dylan', 'email' => 'bob@dylan.com', mentor_id => 11)); # object status = 'active'
+
+###  After the insert, a SELECT is performed to get columns that were generated by DEFAULT values
+echo $newstud->creation_date;  # this value should have been filled by the database
+
+
+###  Update Many-to-Many relationship
+###    This method will INSERT and DELETE as necessary, leaving existing rows intact
+$newstud->set_complete_relation('friends',array(18,79,20,728)); # add 4 friends
+
+###  Add a new Many-to-Many relation
+$newstud->add_relation('enemies', 666); # add an enemy
+
+###  Accessing Has Many relations as object properties become arrays
+###  Accessing Has One relations as object properties become objects or null
+echo $newstud->friends[0]->name;  # Show my first friend's name (sorted by name)
+
+###  Make SURE that student ID=18 is NOT an enemy!
+if ( $newstud->has_relation('enemies', 18) ) {
+    $newstud->remove_relation('enemies', 18);
+}
+
+###  Expell and Delete
+$newstud->expell('Was lazy.');
+
+###  Delete objects
+$newstud->delete();                                                                            # object status = 'deleted'
+</pre>
+
+An instance of this object represents a row in a database table.
+Basically you create your own class extending this class and
+give it some inforation about the table, it's columnes and
+relations to other tables (and SimpleORM objects that represent
+those tables).  Simple ORM then provides standard get, set,
+save, create, and delete methods to operate on that row.
+
+== Object Caching ==
+
+All objects are cached in a global object cache, so that
+multiple instances of the same object row never simultaneously
+exist in memory.  If it were allowed, then changes to one
+object would not be reflected in the other object.  Object
+caching is done by simple "object forwarding": the first
+object created for a given row in the database (e.g. user Fred
+Jones) is created and is a fully qualified object with that
+object's data and relation cache, the second time a new object
+is requested for the same object, the cache is consulted and
+instead of a fully qualified object, a "forwarded" object is
+returned that has no local data cache (e.g. the second object
+is a "symlink to the first Fred Jones object").  When any
+method is called on the "forwarded" object, that method call
+is just routed and re-called on the actual fully qualified
+object.
+
+== Object Forwarding and Custom Methods ==
+
+Because of this, any methods in your extended class that want to
+access object variables, include this line as the first line of
+the method code:
+
+<pre>
+if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+</pre>
+
+This just quickly checks if the object is a forwarded object
+and the {@link do_object_forward_method()} method takes care of the
+rest.
+
+== Database Compatibility ==
+
+Most major functions have been tested and just worked on
+PostgreSQL, MySQL and SQLite with little or no modification to
+the original code, due to the fact that the databse operations
+are based on PDO, which does most of the database abstraction.
+Most of the rest of the actual SQL is just generally
+cross-compatible with probably 90% of SQL parsers, so the list
+of supported engines may be higher than just these three.
+
+The primary differences so far in databases are in how you use
+specific features.  For example, in PostgreSQL,
+auto-incrementing values are done with named sequences, so the
+'$column_sequences' definition is required (assoc array, key =
+column name, value = sequence name), but you may omit that for
+engines without named sequences.  This feature essentially
+shadows the PDO behavior.
+
+== Pre-Caching of objects ==
+
+In general SimpleORM does a very good object of avoiding extra queries when it already has an object loaded in memory.  But, in complex data situations, especially when you have a primary has_many table with lots of has_one relations spiraling off of it, there is a pre-loading method that can save a LOT of extra loops and queries: pre_load_sub_relations()  The first parameter passed is the name of the has_many relation to pre-load.  It returns that relation just as the internal get_relation() method does.  The second parameter, however, is an array of the names of has_one relation names to hunt for in the SimpleORM object heirarchy.  This is the only SimpleORM object method that is aware of or navigates other SimpleORM objects in any way...  The has_one relations can belong to the has_many relation's target, or to one of it's matching has_one's targets, etc.  It does however avoid joining to the same object twice, so beware in the case of circular references or creative linking...
+
+Literally what this does is to form a gigantic single query attempting to join all these queries into one large query for the sake of doing a "SELECT *" on All of the tables needed for the has_many and all the included has_one realtionships.  It generates column aliases to keep all of the column separated in the output.  NOTE: The "where_clause" in your "has_many" relationship will be used in this new Monster query which also will have lots of other tables joined in.  If some of these joined in tables have the same column names as your primary table, then it's possible that some of the columns you reference in your "where_clause" may become ambiguous references.  To avoid this, it's best to just prefix all column names in your "has_many" relation's "where_clause" with the full table name.
+
+== Object Definition Reference ==
+
+These are some of the properties you define per object to define which table, columns, etc. your class represents.
+
+=== $table ===
+
+The table who's rows this object represents.  Required.
+
+
+=== $primary_key ===
+
+The primary key for this table
+
+A flat array of column names.  Required.
+
+
+=== $column_sequences ===
+
+What columns have sequences by name
+
+An assoc array where the keys are column names and the values are sequence names.  This is only necessary for databases that use sequences (like PostgreSQL), and when those tables have columns with default values that use them.  If these values are not provided, the object will not be able to get any auto-incremented values after a create() (INSERT) call, and if those columns are part of the primary key the object will then be un-usable.
+
+For other database types such as MySQL and SQLite, it is able to get the auto-increment value automatially after create() without having to define $column_sequences.
+
+
+=== $schema ===
+
+Define the columns and simple validation criteria.  Required.
+
+This is an assoc array of
+column names where every value is an assoc array of
+parameters to define column names and validation settings.
+The validation criteria are defined by the [[SimpleORM#do_validation()|do_validation()]]
+function.
+
+These validation checks can be run using the validation
+functions [[SimpleORM#validate()|validate()]], [[SimpleORM#validate_column_value()|validate_column_value()]] or [[SimpleORM#extract_and_validate()|extract_and_validate()]]
+
+
+
+=== $relations ===
+
+Allow quick related object access
+
+Relations are simple ways to link to one or a list of objects
+that directly relate with foreign keys in the database.  The
+relations are accessible as object variables just like columns
+are accesses, but they contain actual SimpleORM object(s).
+This makes it trivial to do drill down to values like this:
+
+<pre>echo $student->classes[0]->class->instructor->name;</pre>
+
+The foreign objects accessed through relations need to be set
+up with their own SimpleORM-derived class in some file.  All
+relation definitions include the filename to require_once(),
+and the name of the class that should be used to instantiate
+the object.
+
+There are currently 2 kinds of relations an object can have:
+'has_one' and 'has_many'.
+
+The 'has_one' type is for when your table row has an ID or
+other Primary key to another entity in the database.  The
+definition for a 'has_one' relationship simply names the
+column(s) that have the PKey of the foreign table.  When
+getting the related object, if it is not found the
+relation accessor returns NULL.
+
+The 'has_many' type is for when there is another table in
+the database that has your object's primary key.  This
+usually implies that your object "owns" that other object,
+but it always means that for every one of your object
+there are 0 or more objects of the other type.  The
+definition for this type includes the table name and
+primary key for the foreign object which must be selected
+in order to instantiate the new object.  It also includes
+the names of the columns in the foreign table that include
+your table's primary key.  The accessor for this relation
+will return an array of all objects found.
+
+Relation data is cached the first time it is called, and
+you must manually call [[SimpleORM#reset_state()|reset_state()]] or [[SimpleORM#clear_relation_cache()|clear_relation_cache()]] to get fresh data.
+
+'has_many' relation definitions can have some custom
+parameters to tune the SQL that is run.  The
+'custom_where_clause' can add special filters to the list
+of objects returned, e.g. only getting 'active' items.
+The 'order_by_clause' can provide quick database-side
+sorting.  This is put directly into the ORDER BY clause,
+so you only have access to sort by columns in the foreign
+table.  This server-side sorting is MUCH faster than
+manually sorting objects once they are in PHP.
+
+== Method Reference ==
+
+=== __construct( [$primary_key [, $select_star_data ] ] ) ===
+
+Each object is represents exactly one row in a database table.  The primary key, passed in the first parameter, can be either a single value, or an array of values for tables where the primary key involves more than one column.
+
+Calling a constructor with no primary key, creates an object in a 'not_created' state, which is primarily useful as a first stage before calling create() which will INSERT the row and make the object usable.  When in a 'not_created' state, most methods and property accesses will generate fatal errors (E_USER_ERROR) including: get(), set(), save(), get_relation(), delete(), pre_load_sub_relations() and property accessors for columns and relations.
+
+The second, optional parameter, can be used seed the object with data in advance.  This lets the object skip doing it's own select query to get the data for it's row, and simply uses the data you provide.  The array must be an associative array, with the key names matching the names and case of the column names in the object's schema definition, and should contain all the columns for the row.
+
+This is mainly useful when you have just done a queried out the data for many rows, and you want to want to then make a bunch of objects with the primary key in each row.  Here is an example which, with all the involved objects will only ever do one query (assuming you are just doing reads):
+
+<pre>
+require_once('models/Fruit.php');
+
+$pdo = getDb();
+
+// Need to select * so that ORM can avoid doing another select
+$sql = 'SELECT * FROM fruit ORDER BY name';
+$fruit_objs = array();
+foreach ($pdo->query($sql) as $row) {
+    /// Passing the second parameter seeds the new object with data
+    $fruit_objs[] = new Fruit($row['fruit_id'], $row);
+}
+</pre>
+
+This is also where object caching and retrieval is
+performed.  The caching model in general makes all object instances instantiated with primary keys act as Singleton's.  The cache key is made by concatenating the
+object 's class, table and primary key values into a
+string.  If the object has been previously cached, it will
+erase as much local object data as possible and set [[SimpleORM#$object_forward|$object_forward]].  This will cause all the methods after
+this to just "redirect" the call to the original cached
+object.
+
+Object caching is not done if any primary key values
+passed were null as this often means that the object row
+has not been created yet.  This will also mean that the
+object's state will be 'not_created'.  Once a successful
+[[SimpleORM#create()|create()]] call has completed, then the state will
+become 'active' and the object will be added to the
+cache.
+
+=== exists() ===
+
+This checks the object's state, by the primary key to see if it is installed and actually represents a row in the database.  If it has not yet done it's first data-retrieval select yet, this call will trigger that database query.
+
+=== reset_state() ===
+
+Quick reset all caches and state
+
+Call this if you suspect that anything Non-SimpleORM
+related has modified the row behind your object, or if any
+of your relations may have been added or removed.  This
+will reset all cached data and the object's state.
+
+see clear_relation_cache()
+
+ 
+=== post_reset_state_handler() ===
+
+To be overridden by child-classes that have their own local caching
+
+=== dbh() ===
+
+Quick access to the actual PDO database handle
+
+ 
+=== get() ===
+
+Get column values and/or relations
+
+Parameters:
+# mixed $arg1    Either an array of column or relation names, a single name, or multiple names passed as arguments (not as an array) e.g. $my_user->get('name','email','birthday')
+
+=== set() ===
+
+Get column values and/or relations
+
+Parameters:
+# array $to_set    An assoc array of columns to set
+
+This sets the local value of the object columns.  To update the row in the database you must later call [[SimpleORM#save()|save()]].
+
+see save()
+see set_and_save()
+
+=== unsaved_columns() ===
+
+Get a quick list of the cols that have been locally [[SimpleORM#set()|set()]], but not yet saved using [[SimpleORM#save()|save()]]
+
+
+=== set_and_save() ===
+
+Convenience, do a [[SimpleORM#set()|set()]] then a [[SimpleORM#save()|save()]]
+
+
+=== save() ===
+
+Take all the columns set locally, and send an UPDATE to the database
+
+
+=== pre_save_handler( $columns_to_save ) ===
+
+See [[ Writing SimpleORM Handlers ]]
+
+To be overridden by child-classes, like a trigger, if it returns false the primary operation exits (but no rollback!)
+
+=== post_save_handler() ===
+
+See [[ Writing SimpleORM Handlers ]]
+
+To be overridden by child-classes, like a trigger, if it returns false the primary operation exits (but no rollback!)
+
+=== get_relation() ===
+
+Directly get a relation, can also be done with get()
+
+
+=== has_relation() ===
+
+for many_to_many relationships only, see if two objects are related
+
+$relation - the name of the relation
+$pkey - an array of the primary key values of the other object
+
+
+=== add_relation() ===
+
+
+
+for many_to_many relationships only
+
+$relation - the name of the relation
+$pkey - an array of the primary key values of the other object
+
+
+=== remove_relation() ===
+
+
+
+for many_to_many relationships only
+
+$relation - the name of the relation
+$pkey - an array of the primary key values of the other object
+
+
+=== set_complete_relation() ===
+
+
+
+for many_to_many relationships only
+
+$relation - the name of the relation
+$pkeys - an array of the primary key values of the other objects
+
+
+=== clear_relation_cache() ===
+
+clear just relation cache, but not column data
+
+
+=== post_clear_relation_cache_handler() ===
+
+To be overridden by child-classes that have their own local caching
+
+
+=== create() ===
+
+Do a database INSERT
+
+This formulates an INSERT query using JUST the columns you
+pass it in the assoc array.  Any other values are assumed
+to be NULL-able, or have default values in the DB.
+
+Because of default values and database-side triggers, it
+doesn't keep the data you just passed it in local data
+cache.  The next time you call a [[SimpleORM#get()|get()]] call it
+will do a new SELECT query.
+
+After insert in order to get the new primary key, it may
+use the [[SimpleORM#$column_sequences|$column_sequences]] to get
+seqeunce-generated values.
+
+Also adds the object to the cache after a successful insert.
+
+
+
+=== pre_create_handler() ===
+
+See [[ Writing SimpleORM Handlers ]]
+
+To be overridden by child-classes, like a trigger, if it returns false the primary operation exits (but no rollback!)
+
+=== post_create_handler() ===
+
+See [[ Writing SimpleORM Handlers ]]
+
+To be overridden by child-classes, like a trigger, if it returns false the primary operation exits (but no rollback!)
+
+=== delete() ===
+
+Do a databse DELETE
+
+Also removes the object from the cache, and sets the state to 'deleted'.  You can't do anything with the object after this point.
+
+
+=== pre_delete_handler() ===
+
+To be overridden by child-classes, like a trigger, if it returns false the primary operation exits (but no rollback!)
+
+
+=== post_delete_handler() ===
+
+To be overridden by child-classes, like a trigger, if it returns false the primary operation exits (but no rollback!)
+
+
+=== pre_load_sub_relations() ===
+
+Acts like get_relation(), but pre-load sub-object's in one query (for "has_many" relations only)
+
+This will return just like get_relation() except that first it will create a Monster query
+to join in a bunch of other tables so it can pre-load them all at once.  NOTE: this will
+spin many nested levels deep looking for "has_one" relationships.  But it will only pre-load
+"has_one" relationships (using an OUTER JOIN).
+
+NOTE: The "where_clause" in your "has_many" relationship will be used in this new Monster query
+which also will have lots of other tables joined in.  If some of these joined in tables have the
+same column names as your primary table, then it's possible that some of the coluns you reference
+in your "where_clause" may become ambiguous references.  To avoid this, it's best to just prefix
+all column names in your "has_many" relation's "where_clause" with the full table name as the alias.
+
+
+
+=== extract() ===
+
+Just extract the given cols from the form
+
+Returns 3 params:
+# an assoc array of JUST the values that passed validation.  Some values might be scrubbed as well, like spaced trimmed if requested.  Use this array to later call [[SimpleORM#set()|set()]].
+# boolean, true or false if all the validations passed
+# an assoc array of errors where the values is a numeric array in the style of the [[SimpleORM#do_validation()|do_validation()]]
+
+There are several variations of calling syntax:
+# validate($form_to_validate, $col_name_1, $col_name_2, $col_name_3, ...)
+# validate($form_to_validate, $array_of_column_names)
+# validate($form_to_validate, $array_of_column_names, $col_name_prefix)
+
+If the $form_to_validate is not passed then $_REQUEST is used.
+
+The $col_name_prefix is used when the assoc key names in
+the form have a prefix, and the error assoc array also
+needs to use that prefix.  This is common when 2 or more
+elements are being edited simiultaneously in one web
+interface and the fields of the different entities would
+otherwise collide and be mixed (e.g. both a class and an
+instructor being edited in the same form and they both
+have a 'name' field, you could then prefix all the class
+fields with 'class_' and all the instructor fields with
+'inst_'.  Note, that the prefix should NOT be already
+included in the column names list.
+
+
+
+=== validate() ===
+
+Take an assoc array, validate all parameters, and return good values, status and errors
+
+Returns 3 params:
+# an assoc array of JUST the values that passed validation.  Some values might be scrubbed as well, like spaced trimmed if requested.  Use this array to later call [[SimpleORM#set()|set()]].
+# boolean, true or false if all the validations passed
+# an assoc array of errors where the values is a numeric array in the style of the [[SimpleORM#do_validation()|do_validation()]]
+
+There are several variations of calling syntax:
+# validate($form_to_validate, $col_name_1, $col_name_2, $col_name_3, ...)
+# validate($form_to_validate, $array_of_column_names)
+# validate($form_to_validate, $array_of_column_names, $col_name_prefix)
+
+If the $form_to_validate is not passed then $_REQUEST is used.
+
+The $col_name_prefix is used when the assoc key names in
+the form have a prefix, and the error assoc array also
+needs to use that prefix.  This is common when 2 or more
+elements are being edited simiultaneously in one web
+interface and the fields of the different entities would
+otherwise collide and be mixed (e.g. both a class and an
+instructor being edited in the same form and they both
+have a 'name' field, you could then prefix all the class
+fields with 'class_' and all the instructor fields with
+'inst_'.  Note, that the prefix should NOT be already
+included in the column names list.
+
+=== extract_and_validate() ===
+
+Combination function for [[SimpleORM#extract()|extract()]] and [[SimpleORM#validate()|validate()]]
+
+Parameters:
+# string $col     The column name to validate.  It uses this to read the schema definition and get the criteria
+# mixed  $value   The value to be tested
+
+Extracts the values from the form hash passed, and passes
+each through the [[SimpleORM#validate()|validate()]] function and returns
+it's output.
+
+Calling style is exactly the same as either [[SimpleORM#extract()|extract()]] or [[SimpleORM#validate()|validate()]], including prefix
+functionality.
+
+
+=== validate_column_value() ===
+
+Single value validations
+
+Parameters:
+# string $col     The column name to validate.  It uses this to read the schema definition and get the criteria
+# mixed  $value   The value to be tested
+
+Returns the output of [[SimpleORM#do_validation()|do_validation()]].
+
+== Global Functions ==
+
+These functions are globally available and most are called internally by various method of SimpleORM.
+
+=== form_extract() ===
+
+Just extract the given cols from the form
+
+Returns 3 params:
+# an assoc array of JUST the values that passed validation.  Some values might be scrubbed as well, like spaced trimmed if requested.  Use this array to later call [[SimpleORM#set()|set()]].
+# boolean, true or false if all the validations passed
+# an assoc array of errors where the values is a numeric array in the style of the [[SimpleORM#do_validation()|do_validation()]]
+
+There are several variations of calling syntax:
+# validate($form_to_validate, $col_name_1, $col_name_2, $col_name_3, ...)
+# validate($form_to_validate, $array_of_column_names)
+# validate($form_to_validate, $array_of_column_names, $col_name_prefix)
+
+If the $form_to_validate is not passed then $_REQUEST is used.
+
+The $col_name_prefix is used when the assoc key names in
+the form have a prefix, and the error assoc array also
+needs to use that prefix.  This is common when 2 or more
+elements are being edited simiultaneously in one web
+interface and the fields of the different entities would
+otherwise collide and be mixed (e.g. both a class and an
+instructor being edited in the same form and they both
+have a 'name' field, you could then prefix all the class
+fields with 'class_' and all the instructor fields with
+'inst_'.  Note, that the prefix should NOT be already
+included in the column names list.
+
+
+
+=== validate() ===
+
+Take an assoc array, validate all parameters, and return good values, status and errors
+
+Returns 3 params:
+# an assoc array of JUST the values that passed validation.  Some values might be scrubbed as well, like spaced trimmed if requested.  Use this array to later call [[SimpleORM#set()|set()]].
+# boolean, true or false if all the validations passed
+# an assoc array of errors where the values is a numeric array in the style of the [[SimpleORM#do_validation()|do_validation()]]
+
+There are several variations of calling syntax:
+# validate($form_to_validate, $col_name_1, $col_name_2, $col_name_3, ...)
+# validate($form_to_validate, $array_of_column_names)
+# validate($form_to_validate, $array_of_column_names, $col_name_prefix)
+
+If the $form_to_validate is not passed then $_REQUEST is used.
+
+The $col_name_prefix is used when the assoc key names in
+the form have a prefix, and the error assoc array also
+needs to use that prefix.  This is common when 2 or more
+elements are being edited simiultaneously in one web
+interface and the fields of the different entities would
+otherwise collide and be mixed (e.g. both a class and an
+instructor being edited in the same form and they both
+have a 'name' field, you could then prefix all the class
+fields with 'class_' and all the instructor fields with
+'inst_'.  Note, that the prefix should NOT be already
+included in the column names list.
+
+=== extract_and_validate() ===
+
+Combination function for [[SimpleORM#extract()|extract()]] and [[SimpleORM#validate()|validate()]]
+
+Parameters:
+# string $col     The column name to validate.  It uses this to read the schema definition and get the criteria
+# mixed  $value   The value to be tested
+
+Extracts the values from the form hash passed, and passes
+each through the [[SimpleORM#validate()|validate()]] function and returns
+it's output.
+
+Calling style is exactly the same as either [[SimpleORM#extract()|extract()]] or [[SimpleORM#validate()|validate()]], including prefix
+functionality.
+
+
+=== validate_column_value() ===
+
+Single value validations
+
+Parameters:
+# string $col     The column name to validate.  It uses this to read the schema definition and get the criteria
+# mixed  $value   The value to be tested
+
+Returns the output of [[SimpleORM#do_validation()|do_validation()]].
+
+
+=== do_validation() ===
+
+Parameters:
+# string $col      the name of the data or database column to be validated (used as a default name if none is passed in the $valhash)
+# string $value    value to test
+# string $valhash  an array containing validation parameters
+
+The validation parameters are passed in an assoc array, (often
+coming from the schema definition of a [[SimpleORM]]
+derived object).
+
+These are some scrubbing operations:
+# Default stripping off of leading and trailing whitespace from all values unless the 'no_strip_ws' parameter is passed.
+# If the 'format' param is 'decimal' it will strip off any leading '+' chars
+# If the 'format' param is 'bool' it will turn all values that are (! isset()) to an actual boolean false value.
+# If the 'format' param is 'credit_card_number' it will drop all space and dash ('-') chars
+# The 'not_empty_string' param will turn empty string values into an actual NULL value
+
+These are the different validation types:
+* The 'required' param is checked first, and if it's present, but the value is not isset(), then it adds an error and returns.  If there is no value, and the 'required' param is not there it will then return success and do no further checks.
+* The 'maxlength' and 'minlength' to dtring length checks
+* The 'regex' and 'negative_regex' params check if the value passes the given regular expression (or not)
+* The 'format' param tests various types including: 'email', 'bool', 'decimal', 'integer', 'date' (UTC), 'datetime' (UTC), 'credit_card' (using LUHN10), 'ip' (v4)
+* The 'gt', 'ge', 'lt', 'le' test if the numeric value is greater than, less than, etc...
+
+If the column value fails, the error format is a numeric array with 2 values:
+# The error phrased in English (used until we get Language abstraction completed and used as a default as coding continues)
+# The error as a more generic code (e.g. 'invalid_regex') that can be used for language abstraction.
+
+The function returns these values:
+# boolean, true or false if the validation passed
+# the (possibly) scrubbed value
+# If failure, an array in the above format, if passed, an empty array.
+
+<pre>
+list($ok, $item_count, $error) = do_validation('item_count',$_REQUEST['item_count'], array( 'name' => "number of items", 'format' => 'integer', 'required' => true ));
+if ( ! $ok ) $request->page->add_error('item_count', $error);
+</pre>
+
+Return value:  mixed
+
+
+=== dbh_query_bind() ===
+
+Run a read-only SQL query with bound parameters
+
+Parameters:
+# string $sql      The SQL query to run
+# mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
+Return value:  PDOStatement
+
+
+=== dbh_do_bind() ===
+
+Execute a (possibly write access) SQL query with bound parameters
+
+Parameters:
+# string $sql      The SQL query to run
+# mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
+Return value:  PDOStatement
