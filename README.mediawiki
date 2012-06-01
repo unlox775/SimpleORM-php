@@ -35,13 +35,24 @@ class MyStudent extends SimpleORM__DBHProvider {
                           'custom_where_clause' => "cancelled IS NOT NULL",         # special condition (other than the FKey column join)
                           'order_by_clause'     => 'course_name',                   # custom sorting (saves local sorting cost)
             ),
+        ###  Simple example if join table's columns match both other Pkeys
+        'teacher'=> array( 'relationship'                    => 'many_to_many',
+                           'include'      => 'model/Teacher.class.php', # A file to require_once(), (should be in include_path)
+                           'class'        => 'Teacher',                 # The class name
+                           'foreign_table'                   => 'student',                      # The final table of the object we will be getting
+                           'join_table'                      => 'student_teacher',                 # The in-between table that has both pKeys
+                           'foreign_table_pkey'              => 'teacher_id',                    # The pKey of the final table (note: can be THIS table's pKey)
+                           'custom_where_clause' => "terminated = 0",         # special condition (can use ft. (foreign table), and jt. (join_table), table aliases)
+                           'order_by_clause'                 => 'name',                         # custom sorting (fields of both the join (jt.) and foreign table (ft.) are valid)
+                           ),
+        ###  Example if join table cols don't match their parent table's PKeys
         'friends'=> array( 'relationship'                    => 'many_to_many',
                            'include'                         => 'model/MyStudent.class.php',    # A file to require_once(), (should be in include_path)
                            'class'                           => 'MyStudent',                    # The class name (NOTE: can be THIS class)
                            'foreign_table'                   => 'student',                      # The final table of the object we will be getting
                            'join_table'                      => 'student_peer',                 # The in-between table that has both pKeys
-                           'foreign_table_pkey'              => 'student_id',                   # The pKey of the final table (NOTE: can be THIS table's pKey)
-                           'change_status_instead_of_delete' => false,                          # OPTIONAL: Instead of delete, set "status" and "inactive_date" columns (requires you add these cols)
+                           'pkey_columns_in_join_table' => 'my_student_id'        # (optional) if your PKey is named different in the join table
+                           'foreign_table_pkey'              => array('join_table_other_student_id' => 'student_id'),                    # The pKey of the final table (note: can be THIS table's pKey)
                            'join_table_fixed_values'         => array('peer_type' => 'friend'), # OPTIONAL: Alwyas set (and assume to be set) these cols.  Allows for multi-use of the same table    
                            'order_by_clause'                 => 'name',                         # custom sorting (fields of both the join (jt.) and foreign table (ft.) are valid)
                            ),
@@ -50,7 +61,8 @@ class MyStudent extends SimpleORM__DBHProvider {
                            'class'                           => 'MyStudent',                    # The class name (NOTE: can be THIS class)
                            'foreign_table'                   => 'student',                      # The final table of the object we will be getting
                            'join_table'                      => 'student_peer',                 # The in-between table that has both pKeys
-                           'foreign_table_pkey'              => 'sst_fr_id',                    # The pKey of the final table (note: can be THIS table's pKey)
+                           'pkey_columns_in_join_table' => 'my_student_id'        # (optional) if your PKey is named different in the join table
+                           'foreign_table_pkey'              => array('join_table_other_student_id' => 'student_id'),                    # The pKey of the final table (note: can be THIS table's pKey)
                            'change_status_instead_of_delete' => false,                          # OPTIONAL: Instead of delete, set "status" and "inactive_date" columns (requires you add these cols)
                            'join_table_fixed_values'         => array('peer_type' => 'enemy'),  # OPTIONAL: Alwyas set (and assume to be set) these cols.  Allows for multi-use of the same table
                            'order_by_clause'                 => 'name',                         # custom sorting (fields of both the join (jt.) and foreign table (ft.) are valid)
@@ -73,10 +85,14 @@ class MyStudent extends SimpleORM__DBHProvider {
     }
 }
 
-###  New student
-$newstud = MyStudent();                                                                        # object status = 'not_created'
+###  Existing student
+$newstud = new MyStudent(17);
+echo $newstud->name;
+echo $newstud->get('email');
+echo $newstud->mentor->name;
 
 ###  Inserts new row into database
+$newstud = new MyStudent();                                                                        # object status = 'not_created'
 $newstud->create(array('name' => 'Bob Dylan', 'email' => 'bob@dylan.com', mentor_id => 11)); # object status = 'active'
 
 ###  After the insert, a SELECT is performed to get columns that were generated by DEFAULT values
@@ -728,3 +744,99 @@ Parameters:
 # string $sql      The SQL query to run
 # mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
 Return value:  PDOStatement
+
+
+==  Extensions  ==
+
+==  get_where() ==
+
+This is a static method allowing quick SQL Selects with bound parameters, that return one or more of the ORM object you are selecting.
+
+Syntax example:
+
+<pre>
+###  Get a single object (e.g. by a unique key), this will return an object or NULL
+MyStudent::get_where(array('email' => $_REQUEST['email'], "status != 'deleted'"), true);
+
+###  Get a list of students (limit to 50, sort by name), this will return an array with 0 or more objects
+MyStudent::get_where(array('lname' => $_REQUEST['search_last_name'], "status != 'deleted'"), 50, 'fname ASC, lname ASC');
+</pre>
+
+'''Need for Per-Object configuration'''
+
+A static method get_where() needs to be defined in each class that will use it.  This is a short stub that just calls the parent::get_where() method.
+
+<pre>
+    public static function get_where($where = null, $limit_or_only_one = false, $order_by = null) { return parent::get_where($where, $limit_or_only_one, $order_by); }
+</pre>
+
+This is because PHP does not preserve the class in static method calls, adding this get_where ONLY to your base class won't work.  The base class has NO way of determining the actual class of the object you were calling on.  (i.e. MyStudent::get_where() would ONLY appear as SimpleORM__DBHProvider::get_where() with no way to figure it out.)
+
+To include this library:
+<pre>
+
+class SimpleORM__DBHProvider extends SimpleORM {
+
+    ...  Regular class definition ...
+
+    ///  Simple static function to get object(s) with simple WHERE
+    public static function get_where($where = null, $limit_or_only_one = false, $order_by = null) {
+
+        ///  Because we are STATIC, and most everything we need is NON-STATIC
+        ///    we first need a backtrace lead to tell us WHICH object is even
+        ///    our parent, and then we can create an empty parent Non-Static
+        ///    object to get the few params we need...
+        $bt = debug_backtrace();
+        if ( $bt[1]['function'] != 'get_where' ) {
+            trigger_error("Use of get_where() when not set up!  The hack for whetever object you are calling is not set up!<br/>\n
+                           You need to add a get_where() stub to your object (the one you are referring to in ". $bt[0]['file'] ." on line ". $bt[0]['line'] ."), that looks like:<br/>\n".'
+                           public static function get_where($where = null, $limit_or_only_one = false, $order_by = null) { return parent::get_where($where, $limit_or_only_one, $order_by);'."<br/>\n".'
+                           ' , E_USER_ERROR);
+        }
+        $parent_class = $bt[1]['class'];
+
+        ///  Otherwise, just get the parent object and continue
+        $tmp_obj = new $parent_class ();
+
+        
+        ///  Assemble a generic SQL based on the table of this object
+        $values = array();
+
+		if( $where ) {
+		    $where_ary = array();  foreach ($where as $col => $val) {
+                ///  If the where condition is just a string (not an assocative COL = VALUE), then just add it..
+                if ( is_int($col) ) { $where_ary[] = $val; }
+                ///  Otherwise, basic ( assocative COL = VALUE )
+                else { $where_ary[] = "$col = ?";  $values[] = $val; }
+            }
+        }
+        $sql = "SELECT *
+                  FROM ". $tmp_obj->get_table() ."
+                 WHERE ". ( $where_ary ? join(' AND ', $where_ary) : '1' ) ."
+                 ". ( ! is_null($order_by) ? ( "ORDER BY ". $order_by ) : '' ) ."
+		   	  ". ( ( $limit_or_only_one !== true && $limit_or_only_one ) ? ( "LIMIT " . $limit_or_only_one ) : '' ) ."
+                ";
+        $sth = $tmp_obj->dbh_query_bind($sql, $values);
+        $data = $sth->fetchAll();
+            
+        ///  Get the objs
+        $objs = array();
+        foreach ( $data as $row ) {
+            $pk_values = array(); foreach( $tmp_obj->get_primary_key() as $pkey_col ) $pk_values[] = $row[ $pkey_col ];
+            $objs[] = new $parent_class ( $pk_values, $row );
+        }
+
+        ///  If they only ask asking for one object, just guve them that, not the array
+        return ( ($limit_or_only_one === true || $limit_or_only_one === 1) ? ( empty( $objs ) ? null :  $objs[0] ) : $objs );
+    }
+
+
+}
+class MyStudent extends SimpleORM__DBHProvider {
+
+    ...  Regular class definition ...
+
+    public static function get_where($where = null, $limit_or_only_one = false, $order_by = null) { return parent::get_where($where, $limit_or_only_one, $order_by); }
+
+}
+</pre>
