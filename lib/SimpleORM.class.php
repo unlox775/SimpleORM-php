@@ -250,9 +250,9 @@ class SimpleORM {
      *
      */
     protected $relations = array();
-    protected $dbh = null;
+    public $dbh = null;
     protected $dbh_type = null;
-    protected $pk_values = array();
+    public $pk_values = array();
     protected $data = array();
     protected $relation_data = array();
     protected $columns_to_save = array();
@@ -284,7 +284,7 @@ class SimpleORM {
      * @param mixed $pk_value            Either an array of values representing the primary key for this object, or a single non-array value if the PKey is only 1 column (or an empty array for a pseudo object)
      * @param mixed $select_star_data    If you got the PKey from a SQL query you just ran and you also got the full "select * from ..." for that table row, just pass that (assoc) array here and it'll save SimplORM from having to re-query the data
      */
-    public function __construct($pk_value = array(), $select_star_data = null) {
+    public function __construct($pk_value = array(), $select_star_data = null, $sync_dbh = null) {
         global $SimpleORM_OBJECT_CACHE;
 
         ###  Handle one or an array or PK values
@@ -298,20 +298,25 @@ class SimpleORM {
             ###  For now, just trust it...  Maybe later we'll make it check that all the cols are present...
             $this->data = $select_star_data;
         }
+		###  For when you KNOW the DBH ID, like for internal object creation...
+        if ( is_int( $sync_dbh ) ) {
+            $this->dbh = $sync_dbh;
+        }
 
         ###  Reference a cached object if available (skip caching if any of the PK values are NULL)
         $has_null_pk_values = false;
         $pk_string = array();  foreach ($this->primary_key as $col) { if ( ! isset($this->pk_values[$col]) || is_null($this->pk_values[$col]) ) $has_null_pk_values = true;  $pk_string[] = $this->pk_values[$col]; }
+		if ( is_null( $this->dbh ) ) $this->load_dbh();
         if ( ! $has_null_pk_values ) {
             $this->cache_key = get_class($this). '||--||'. $this->table .'||--||'. join('||--||', $pk_string); 
-			if ( isset($SimpleORM_OBJECT_CACHE[ $this->cache_key ]) ) {
-                $this->object_forward = $SimpleORM_OBJECT_CACHE[$this->cache_key];
+			if ( isset($SimpleORM_OBJECT_CACHE[ $this->dbh ][ $this->cache_key ]) ) {
+                $this->object_forward = $SimpleORM_OBJECT_CACHE[ $this->dbh ][$this->cache_key];
 #				bug("USING CACHE: ".$this->cache_key);
             
                 ###  Blank out some $this data to save memory
                 unset($this->data, $this->table, $this->schema, $this->relations, $this->primary_key, $this->pk_values, $this->dbh, $this->columns_to_save, $this->obj_state, $this->cache_key );
             }
-            else { $SimpleORM_OBJECT_CACHE[$this->cache_key] = $this; }
+            else { $SimpleORM_OBJECT_CACHE[ $this->dbh ][$this->cache_key] = $this; }
         }
         ###  Otherwise, they called it with none or not enough PKey params, so they must be plannin on calling ->create() later...
         else $this->obj_state = 'not_created';
@@ -375,6 +380,7 @@ class SimpleORM {
      */
     public function dbh() {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		
         if ( is_null( $this->dbh ) ) $this->load_dbh();
         return $GLOBALS['SimpleORM_DBH_CACHE'][ $this->dbh ];
     }
@@ -407,7 +413,6 @@ class SimpleORM {
             if ( !    isset($this->schema[$col])
                  && ! isset($this->relations[$col])
                 ) {
-				trace_dump();
                 trigger_error('Call to get() invalid column '. get_class($this) .'::'. $col .' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
                 return false;
             }
@@ -429,7 +434,7 @@ class SimpleORM {
                       FROM ". $this->table ."
                      WHERE ". join(' AND ', $pk_where) ."
                       "; # " DUMB PHP emacs syntax hiliting
-            $sth = dbh_query_bind($sql, $values);
+            $sth = $this->dbh_query_bind($sql, $values);
             ###  If the user has an active account then...
             $this->data = $sth->fetch(PDO::FETCH_ASSOC);
 
@@ -524,6 +529,10 @@ class SimpleORM {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         return $this->primary_key;
     }
+    public function get_relations() {
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        return $this->relations;
+    }
 
     /** 
      * set_and_save() - Convenience, do a {@link set()} then a {@link save()}
@@ -556,7 +565,7 @@ class SimpleORM {
                    SET ". join(',', $set_clause) ."
                  WHERE ". join(' AND ', $pk_where) ."
                   "; #"
-        $sth = dbh_do_bind($sql, $values);
+        $sth = $this->dbh_do_bind($sql, $values);
 
         if ( ! $this->post_save_handler($this->columns_to_save) ) return false;
         
@@ -608,8 +617,7 @@ class SimpleORM {
             ###  Read the 'columns' definition
             $rel_pk_values = array();
             $are_null_values = false;
-            if ( is_array($rel['columns']) ) { foreach ( $rel['columns'] as $col ) { if (( $rel_pk_values[] = $this->get($col)            ) === null) $are_null_values = true; } }
-            else                                                                   { if (( $rel_pk_values[] = $this->get($rel['columns']) ) === null) $are_null_values = true; }
+            foreach ( (array) $rel['columns'] as $col ) { if (( $rel_pk_values[] = $this->get($col)            ) === null) $are_null_values = true; } 
         
             ###  Can't do this type with NULL values
             if ( $are_null_values ) { END_TIMER('SimpleORM get_relationship has_one', ORM_SQL_PROFILE);  return null; }
@@ -617,7 +625,8 @@ class SimpleORM {
             $class = $rel['class'];
             if ( ! class_exists($class) ) require_once( $this->include_prefix() . $rel['include']);
 
-            $this->relation_data[$name] = new $class ($rel_pk_values);
+            $this->relation_data[$name] = new $class ($rel_pk_values, null, $this->dbh);
+
             END_TIMER('SimpleORM get_relationship has_one', ORM_SQL_PROFILE);
         }
         else if ( $rel['relationship'] == 'has_many' ) {
@@ -659,7 +668,7 @@ class SimpleORM {
                      ". ((! empty($where)                  ) ? "WHERE ". join(' AND ', $where)      : "") ."
                      ". ((! empty($rel['order_by_clause']) ) ? "ORDER BY ". $rel['order_by_clause'] : "") ."
                       "; # " DUMB emacs PHP syntax hiliting
-				$sth = dbh_query_bind($sql, $values);
+				$sth = $this->dbh_query_bind($sql, $values);
 
 				###  Get the data and convert it into an array of objects...
 				$data = $sth->fetchAll(PDO::FETCH_ASSOC);
@@ -671,7 +680,7 @@ class SimpleORM {
             $obj_list = array();
             foreach ( $data as $row ) {
                 $pkey_vals = array();  foreach ($foreign_pkey as $col) { $pkey_vals[] = $row[$col]; }
-                $obj_list[join('||--||',$pkey_vals)] = new $class ($pkey_vals,$row);
+                $obj_list[join('||--||',$pkey_vals)] = new $class ($pkey_vals,$row,$this->dbh);
             }
 
             $this->relation_data[$name] = $obj_list;
@@ -721,8 +730,8 @@ class SimpleORM {
 				$data = call_user_func_array($hook, array($rel));
 			} else {
 				$values = array();
-				$where = array();  foreach ($pkey_columns_in_join_table as $i => $col) { $where[] = "jt.$col = ?";  $values[] = $this->pk_values[$this->primary_key[$i]]; }
-				foreach                     ($join_table_fixed_values as $col => $val) { $where[] = "jt.$col = ?";  $values[] = $val; }
+ 				$where = array();  foreach ($pkey_columns_in_join_table as $i => $col) { $where[] = "jt.$col = ?";  $values[] = $this->pk_values[$this->primary_key[$i]]; }
+				foreach                    ($join_table_fixed_values as $col => $val) { $where[] = "jt.$col = ?";  $values[] = $val; }
 				if ( ! empty($rel['custom_where_clause']) )        $where[] = $rel['custom_where_clause'];
 				if ( isset($rel['change_status_instead_of_delete'])
 					 && $rel['change_status_instead_of_delete']  ) $where[] = "jt.status = 'active'";
@@ -732,7 +741,7 @@ class SimpleORM {
                       ". ((! empty($where)                  ) ? "WHERE ". join(' AND ', $where)      : "") ."
                       ". ((! empty($rel['order_by_clause']) ) ? "ORDER BY ". $rel['order_by_clause'] : "") ."
                       "; # " DUMB emacs PHP syntax hiliting
-				$sth = dbh_query_bind($sql, $values);
+				$sth = $this->dbh_query_bind($sql, $values);
 
 				###  Get the data and convert it into an array of objects...
 				$data = $sth->fetchAll(PDO::FETCH_ASSOC);
@@ -744,7 +753,7 @@ class SimpleORM {
             $obj_list = array();
             foreach ( $data as $row ) {
                 $pkey_vals = array();  foreach ($foreign_pkey as $col) { $pkey_vals[] = $row[$col]; }
-                $obj_list[join('||--||',$pkey_vals)] = new $class ($pkey_vals,$row);
+                $obj_list[join('||--||',$pkey_vals)] = new $class ($pkey_vals,$row,$this->dbh);
             }
 
             $this->relation_data[$name] = $obj_list;
@@ -791,7 +800,8 @@ class SimpleORM {
     public function add_relation($relation, $pkey) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         if($this->has_relation($relation, $pkey)) return true;
-#		bug('Didnt have relation in'. get_class($this) .'->'. $relation, $pkey, array_keys((array) $this->relation_data[$relation]));
+        
+#        bug('Didnt have relation in'. get_class($this) .'->'. $relation, $pkey, array_keys((array) $this->relation_data[$relation]));
         
 		###  Update relation_data so that further has_relation() calls are already cached
         $relation_key = join('||--||',(array) $pkey);
@@ -805,9 +815,9 @@ class SimpleORM {
 		###  If the column names in the Join table aren't the same as they are in my table
 		$pkey_columns_in_join_table = $this->primary_key;
 		if ( ! empty( $rel['pkey_columns_in_join_table'] ) ) {
-			$pkey_columns_in_join_table = (array) $rel['pkey_columns_in_join_table'];
+			$pkey_columns_in_join_table = (array) $rel['pkey_c/olumns_in_join_table'];
 		}
-		
+        
         ###  If there are any 'join_table_fixed_values'
         $join_table_fixed_values = array();
         if ( isset($rel['join_table_fixed_values']) && is_array($rel['join_table_fixed_values']) ) {
@@ -824,11 +834,11 @@ class SimpleORM {
 			$q_marks[] = "?";
 			$values[] = array_key_exists($foreign_pkey[$jt_pk],$pkey) ? $pkey[$foreign_pkey[$jt_pk]] : $pkey[$i];
 		}
-        foreach( $join_table_fixed_values    as $col => $val   ) { $fields[] = $col; $q_marks[] = "?"; $values[] = $val;}
+        foreach( $join_table_fixed_values as $col => $val) { $fields[] = $col; $q_marks[] = "?"; $values[] = $val;}
         $sql = "INSERT INTO ". $rel['join_table'] ." (". join(',',$fields) .") 
                 VALUES (". join(',', $q_marks).") ";
 
-		$sth = dbh_do_bind($sql, $values);
+		$sth = $this->dbh_do_bind($sql, $values);
         
         return true;
     }
@@ -854,7 +864,7 @@ class SimpleORM {
         if ( isset($rel['join_table_fixed_values']) && is_array($rel['join_table_fixed_values']) ) {
             $join_table_fixed_values = $rel['join_table_fixed_values'];
         }
-
+            
 		###  If the column names in the Join table aren't the same as they are in my table
 		$pkey_columns_in_join_table = $this->primary_key;
 		if ( ! empty( $rel['pkey_columns_in_join_table'] ) ) {
@@ -870,7 +880,7 @@ class SimpleORM {
 			$where[] = (is_int($jt_pk) ? $foreign_pkey[$jt_pk] : $jt_pk)." = ?"; 
 			$values[] = array_key_exists($foreign_pkey[$jt_pk],$pkey) ? $pkey[$foreign_pkey[$jt_pk]] : $pkey[$i];
 		}
-        foreach                    ($join_table_fixed_values    as $col => $val) { $where[] = "$col = ?";               $values[] = $val; }
+        foreach                    ($join_table_fixed_values as $col => $val) { $where[] = "$col = ?";               $values[] = $val; }
         if ( ! empty($rel['custom_where_clause']) ) $where[] = $rel['custom_where_clause'];
 
         ###  Assemble the SQL, (either UDPATE or DELETE)
@@ -891,7 +901,7 @@ class SimpleORM {
             $sql = "DELETE FROM ". $rel['join_table'];
         }
         $sql .= " WHERE ". join(' AND ', $where);
-        $sth = dbh_do_bind($sql, $values);
+        $sth = $this->dbh_do_bind($sql, $values);
         
         return true;
     }
@@ -1016,7 +1026,7 @@ class SimpleORM {
         $sql = "INSERT INTO ". $this->table ." (". join(',', $fields) .")
                 VALUES (". join(',', $q_marks) .")
                   "; #"
-        $sth = dbh_do_bind($sql, $values);
+        $sth = $this->dbh_do_bind($sql, $values);
 
         ###  Populate $this->pk_values
         foreach ($this->primary_key as $col) {
@@ -1042,7 +1052,7 @@ class SimpleORM {
         ###  Add to cache
         $pk_string = array();  foreach ($this->primary_key as $col) { $pk_string[] = $this->pk_values[$col]; }
         $this->cache_key = get_class($this). '||--||'. $this->table .'||--||'. join('||--||', $pk_string);
-        $SimpleORM_OBJECT_CACHE[$this->cache_key] = $this;
+        $SimpleORM_OBJECT_CACHE[ $this->dbh ][$this->cache_key] = $this;
             
         if ( ! $this->post_create_handler($to_set) ) return false;
         
@@ -1075,7 +1085,7 @@ class SimpleORM {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
 
 		$class = get_class($this);
-		$my_clone = new $class(array());
+		$my_clone = new $class(array(), null, $this->dbh);
 
 		$data = array();
 		foreach ( $this->schema as $col => $x ) { if ( ! in_array($col, $this->primary_key) ) $data[$col] = $this->get($col); }
@@ -1113,7 +1123,7 @@ class SimpleORM {
         $sql = "DELETE FROM ". $this->table ."
                  WHERE ". join(' AND ', $pk_where) ."
                   "; #"
-        $sth = dbh_do_bind($sql, $values);
+        $sth = $this->dbh_do_bind($sql, $values);
 
         ###  Reset any data beside the PK values
         unset($this->data, $this->dbh, $this->columns_to_save );
@@ -1123,8 +1133,8 @@ class SimpleORM {
         
         ###  Free up the cache item, Any other objects that are still object_forwarded
         ###    to this will also now appear "deleted".  If you're messy, this can bite you!
-        if ( isset($SimpleORM_OBJECT_CACHE[$this->cache_key] ) ) {
-            unset( $SimpleORM_OBJECT_CACHE[$this->cache_key] );
+        if ( isset($SimpleORM_OBJECT_CACHE[ $this->dbh ][$this->cache_key] ) ) {
+            unset( $SimpleORM_OBJECT_CACHE[ $this->dbh ][$this->cache_key] );
         }
             
         return true;
@@ -1225,7 +1235,7 @@ class SimpleORM {
                   "; # " DUMB emacs PHP syntax hiliting
         if (SQL_DEBUG) trace_dump();
         if (SQL_DEBUG) bug($sql, $values);
-        $sth = dbh_query_bind($sql, $values);
+        $sth = $this->dbh_query_bind($sql, $values);
 
 
         ###  Get the data and convert it into an array of objects...
@@ -1256,7 +1266,7 @@ class SimpleORM {
                 if ( $any_pkeys_were_null ) continue; 
 
                 $g_class = $sub_tables['aliases'][$alias];
-                $obj = new $g_class ($pkey_vals,$grow);
+                $obj = new $g_class ($pkey_vals,$grow,$this->dbh);
 
                 ###  If this is the Primary table, then add it to the object list
                 ###    ( otherwise, we have pre-loaded the object, and we're done)
@@ -1277,7 +1287,9 @@ class SimpleORM {
         $seen[] = $class;
 
         ###  Get a blank object
-        if ( is_null( $obj ) ) $obj = new $class ();
+        if ( is_null( $obj ) ) {
+			$obj = new $class (array(), null, $this->dbh);
+		}
         foreach ( $obj->__relations() as $name => $rel ) {
             if ( $rel['relationship'] != 'has_one'
                  || ! in_array( $name, $sub_relations_to_load )
@@ -1285,7 +1297,7 @@ class SimpleORM {
 
             $sub_class = $rel['class'];
             if ( ! class_exists($sub_class) ) require_once($this->include_prefix() . $rel['include']);
-            $sub_obj = new $sub_class ();
+            $sub_obj = new $sub_class (array(), null, $this->dbh);
 
             ###  Record what we need to Join this table and get it's columns
             $sub_alias = str_repeat( array_shift( $sub_tables['alias_letters'] ), 4 );
@@ -1457,6 +1469,78 @@ class SimpleORM {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         return validate_column_value($col, $value, $this->schema);
     }
+
+	
+	/**
+	 * dbh_query_bind() - Run a read-only SQL query with bound parameters
+	 *
+	 * @param string $sql      The SQL query to run
+	 * @param mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
+	 * @return PDOStatement
+	 */
+	function dbh_query_bind( $sql ) {
+	    $use_dbh = $this->dbh();
+	    if ( ORM_SQL_PROFILE ) START_TIMER('dbh_query_bind');
+	    $bind_params = array_slice( func_get_args(), 1 );
+	    ###  Allow params passed in an array or as args
+	    if ( is_a( $bind_params[ count($bind_params) - 1 ], 'PDO' ) || is_a( $bind_params[ count($bind_params) - 1 ], 'PhoneyPDO' ) ) $use_dbh = array_pop($bind_params);
+	    if ( count( $bind_params ) == 1 && ( $tmp = array_values($bind_params) ) && is_array($tmp[0]) ) { $bind_params = $tmp[0]; };
+	    $this->reverse_t_bools($bind_params);
+	    if (ORM_SQL_DEBUG) trace_dump();
+	    if (ORM_SQL_DEBUG) bug($sql, $bind_params);
+	    $GLOBALS['ORM_SQL_LOG'][] = array(microtime(true), $sql, $bind_params);
+	    try { 
+	        $sth = $use_dbh->prepare($sql);
+	        $rv = $sth->execute($bind_params);
+	    } catch (PDOException $e) {
+	        trace_dump();
+	        $err_msg = 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line();
+	        if ( strlen($err_msg) > 1024 ) {
+	            bug($err_msg,$sql,$bind_params,$e->getMessage());
+	            $sql = substr($sql,0,1020 + strlen($sql) - strlen($err_msg) ).'...';
+	        }
+	        trigger_error( 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line(), E_USER_ERROR);
+	        return false;
+	    }
+	    if ( ORM_SQL_PROFILE ) END_TIMER('dbh_query_bind');
+	    return $sth;
+	}
+	/**
+	 * dbh_do_bind() - Execute a (possibly write access) SQL query with bound parameters
+	 *
+	 * @param string $sql      The SQL query to run
+	 * @param mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
+	 * @return PDOStatement
+	 */
+	function dbh_do_bind( $sql ) {
+	    $use_dbh = $this->dbh();
+	    if ( ORM_SQL_PROFILE ) START_TIMER('dbh_do_bind');
+	    $bind_params = array_slice( func_get_args(), 1 );
+	    ###  Allow params passed in an array or as args
+	    if ( is_a( $bind_params[ count($bind_params) - 1 ], 'PDO' ) || is_a( $bind_params[ count($bind_params) - 1 ], 'PhoneyPDO' ) ) $use_dbh = array_pop($bind_params);
+	    if ( count( $bind_params ) == 1 && is_array(array_shift(array_values($bind_params))) ) { $bind_params = array_shift(array_values($bind_params)); };
+	    
+	    $this->reverse_t_bools($bind_params);
+	    if (ORM_SQL_DEBUG || ORM_SQL_WRITE_DEBUG) bug($sql, $bind_params);
+	    $GLOBALS['ORM_SQL_LOG'][] = array(microtime(true), $sql, $bind_params);
+	    try { 
+	        $sth = $use_dbh->prepare($sql);
+	        $rv = $sth->execute($bind_params);
+	    } catch (PDOException $e) {
+	        trace_dump();
+	        $err_msg = 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line();
+	        if ( strlen($err_msg) > 1024 ) {
+	            bug($err_msg,$sql,$bind_params,$e->getMessage());
+	            $sql = substr($sql,0,1020 + strlen($sql) - strlen($err_msg) ).'...';
+	        }
+	        trigger_error( 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line(), E_USER_ERROR);
+	        return false;
+	    }
+	    if ( ORM_SQL_PROFILE ) END_TIMER('dbh_do_bind');
+	    return $rv;
+	}
+	function reverse_t_bools(&$ary) { if (! is_array($ary)) return;  foreach($ary as $k => $v) { if ($v === true) $ary[$k] = 't';  if ($v === false) $ary[$k] = 'f'; } }
+	
 }
 
 
@@ -1825,75 +1909,3 @@ function is_valid_date_time($dateTime)
 
     return false;
 }
-
-/**
- * dbh_query_bind() - Run a read-only SQL query with bound parameters
- *
- * @param string $sql      The SQL query to run
- * @param mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
- * @return PDOStatement
- */
-function dbh_query_bind( $sql ) {
-    if ( isset( $GLOBALS['orm_dbh'] ) ) $use_dbh = $GLOBALS['orm_dbh'];
-    if ( ORM_SQL_PROFILE ) START_TIMER('dbh_query_bind');
-    $bind_params = array_slice( func_get_args(), 1 );
-    ###  Allow params passed in an array or as args
-    if ( is_a( $bind_params[ count($bind_params) - 1 ], 'PDO' ) || is_a( $bind_params[ count($bind_params) - 1 ], 'PhoneyPDO' ) ) $use_dbh = array_pop($bind_params);
-    if ( ! isset( $GLOBALS['orm_dbh'] ) ) $GLOBALS['orm_dbh'] = $use_dbh; # steal their DBH for global use, hehehe
-    if ( count( $bind_params ) == 1 && ( $tmp = array_values($bind_params) ) && is_array($tmp[0]) ) { $bind_params = $tmp[0]; };
-    reverse_t_bools($bind_params);
-    if (ORM_SQL_DEBUG) trace_dump();
-    if (ORM_SQL_DEBUG) bug($sql, $bind_params);
-    $GLOBALS['ORM_SQL_LOG'][] = array(microtime(true), $sql, $bind_params);
-    try { 
-        $sth = $use_dbh->prepare($sql);
-        $rv = $sth->execute($bind_params);
-    } catch (PDOException $e) {
-        trace_dump();
-        $err_msg = 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line();
-        if ( strlen($err_msg) > 1024 ) {
-            bug($err_msg,$sql,$bind_params,$e->getMessage());
-            $sql = substr($sql,0,1020 + strlen($sql) - strlen($err_msg) ).'...';
-        }
-        trigger_error( 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line(), E_USER_ERROR);
-        return false;
-    }
-    if ( ORM_SQL_PROFILE ) END_TIMER('dbh_query_bind');
-    return $sth;
-}
-/**
- * dbh_do_bind() - Execute a (possibly write access) SQL query with bound parameters
- *
- * @param string $sql      The SQL query to run
- * @param mixed $params   this can either be called passing an array of bind params, or just by passing the bind params as args after the SQL arg
- * @return PDOStatement
- */
-function dbh_do_bind( $sql ) {
-    if ( isset( $GLOBALS['orm_dbh'] ) ) $use_dbh = $GLOBALS['orm_dbh'];
-    if ( ORM_SQL_PROFILE ) START_TIMER('dbh_do_bind');
-    $bind_params = array_slice( func_get_args(), 1 );
-    ###  Allow params passed in an array or as args
-    if ( is_a( $bind_params[ count($bind_params) - 1 ], 'PDO' ) || is_a( $bind_params[ count($bind_params) - 1 ], 'PhoneyPDO' ) ) $use_dbh = array_pop($bind_params);
-    if ( ! isset( $GLOBALS['orm_dbh'] ) ) $GLOBALS['orm_dbh'] = $use_dbh; # steal their DBH for global use, hehehe
-    if ( count( $bind_params ) == 1 && is_array(array_shift(array_values($bind_params))) ) { $bind_params = array_shift(array_values($bind_params)); };
-    
-    reverse_t_bools($bind_params);
-    if (ORM_SQL_DEBUG || ORM_SQL_WRITE_DEBUG) bug($sql, $bind_params);
-    $GLOBALS['ORM_SQL_LOG'][] = array(microtime(true), $sql, $bind_params);
-    try { 
-        $sth = $use_dbh->prepare($sql);
-        $rv = $sth->execute($bind_params);
-    } catch (PDOException $e) {
-        trace_dump();
-        $err_msg = 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line();
-        if ( strlen($err_msg) > 1024 ) {
-            bug($err_msg,$sql,$bind_params,$e->getMessage());
-            $sql = substr($sql,0,1020 + strlen($sql) - strlen($err_msg) ).'...';
-        }
-        trigger_error( 'There was an error running a SQL statement, ['. $sql .'] with ('. join(',',$bind_params) .'): '. $e->getMessage() .' in ' . trace_blame_line(), E_USER_ERROR);
-        return false;
-    }
-    if ( ORM_SQL_PROFILE ) END_TIMER('dbh_do_bind');
-    return $rv;
-}
-function reverse_t_bools(&$ary) { if (! is_array($ary)) return;  foreach($ary as $k => $v) { if ($v === true) $ary[$k] = 't';  if ($v === false) $ary[$k] = 'f'; } }
