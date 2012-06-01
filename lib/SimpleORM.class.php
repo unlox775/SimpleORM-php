@@ -4,11 +4,13 @@
 if ( ! function_exists('bug')
      && file_exists(dirname('__FILE__') .'/debug.inc.php')
      ) require_once(dirname('__FILE__') .'/debug.inc.php');
-define('ORM_SQL_PROFILE', true);
-define('ORM_SQL_DEBUG', false);
+define('ORM_SQL_PROFILE', true );
+define('ORM_SQL_DEBUG',   false );
 define('ORM_SQL_WRITE_DEBUG', false);
 
 $GLOBALS['SimpleORM_OBJECT_CACHE'] = array();
+$GLOBALS['SimpleORM_DBH_CACHE'] = array();
+$GLOBALS['ORM_SQL_LOG'] = array();
 
 /**
  * SimpleORM Class, for simple-as-possible Object-to-Relational Mapping (for PostgreSQL, MySQL and SQLite)
@@ -257,6 +259,7 @@ class SimpleORM {
     protected $object_forward = null;
     protected $cache_key = null;
     protected $obj_state = null;
+    protected $__remember_old_values = false;
 
     /** 
      * __construct
@@ -301,24 +304,35 @@ class SimpleORM {
         $pk_string = array();  foreach ($this->primary_key as $col) { if ( ! isset($this->pk_values[$col]) || is_null($this->pk_values[$col]) ) $has_null_pk_values = true;  $pk_string[] = $this->pk_values[$col]; }
         if ( ! $has_null_pk_values ) {
             $this->cache_key = get_class($this). '||--||'. $this->table .'||--||'. join('||--||', $pk_string); 
-            if ( array_key_exists($this->cache_key, $SimpleORM_OBJECT_CACHE ) ) {
+			if ( isset($SimpleORM_OBJECT_CACHE[ $this->cache_key ]) ) {
                 $this->object_forward = $SimpleORM_OBJECT_CACHE[$this->cache_key];
-#            bug("USING CACHE: ".$this->cache_key);
+#				bug("USING CACHE: ".$this->cache_key);
             
                 ###  Blank out some $this data to save memory
                 unset($this->data, $this->table, $this->schema, $this->relations, $this->primary_key, $this->pk_values, $this->dbh, $this->columns_to_save, $this->obj_state, $this->cache_key );
             }
             else { $SimpleORM_OBJECT_CACHE[$this->cache_key] = $this; }
         }
+        ###  Otherwise, they called it with none or not enough PKey params, so they must be plannin on calling ->create() later...
+        else $this->obj_state = 'not_created';
     }
     ///  Wait as late as possible to get the DBH...
     protected function load_dbh() {
         ###  Get the database handle
         if ( is_null( $this->dbh ) ) {
-            $this->dbh      =& $this->provide_dbh();
-            $this->dbh_type =& $this->provide_dbh_type();
+			///  Default value
+            $this->dbh = count($GLOBALS['SimpleORM_DBH_CACHE']);
+
+			///  Now, see if this object is already in the cache...
+			$dbh_obj = $this->provide_dbh();
+			foreach ( $GLOBALS['SimpleORM_DBH_CACHE'] as $i => $this_dbh_obj ) {
+				if ( $this_dbh_obj === $dbh_obj ) { $this->dbh = $i; break; }
+			}
+
+            $GLOBALS['SimpleORM_DBH_CACHE'][ $this->dbh ] = $dbh_obj;
+            $this->dbh_type                               = $this->provide_dbh_type();
         }
-        $GLOBALS['orm_dbh'] = $this->dbh;
+        $GLOBALS['orm_dbh'] = $GLOBALS['SimpleORM_DBH_CACHE'][ $this->dbh ];
     }
 
     protected function provide_dbh() {}
@@ -332,7 +346,7 @@ class SimpleORM {
      */
     public function exists() {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
-        if ( $this->obj_state == 'not_created') return false;
+        if ( $this->obj_state == 'not_created' || $this->obj_state == 'deleted') return false;
         return ( $this->obj_state == 'active' || ! is_null($this->get($this->primary_key[0])) );
     }
     /**
@@ -362,7 +376,7 @@ class SimpleORM {
     public function dbh() {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         if ( is_null( $this->dbh ) ) $this->load_dbh();
-        return $this->dbh;
+        return $GLOBALS['SimpleORM_DBH_CACHE'][ $this->dbh ];
     }
         
     
@@ -386,23 +400,24 @@ class SimpleORM {
         $columns = func_get_args();
 
         ###  Allow params passed in an array or as args
-        if ( count( $columns ) == 1 && is_array(array_shift(array_values($columns))) ) { $cols_from_array = true;  $columns = array_shift(array_values($columns)); };
+        if ( count( $columns ) == 1 && ($tmp = array_values($columns)) && is_array($tmp[0]) ) { $cols_from_array = true;  $columns = $tmp[0]; };
         
         ###  Check out the column names (AND relations)
         foreach ($columns as $col) {
-            if ( !    array_key_exists($col, $this->schema)
-                 && ! array_key_exists($col, $this->relations)
+            if ( !    isset($this->schema[$col])
+                 && ! isset($this->relations[$col])
                 ) {
+				trace_dump();
                 trigger_error('Call to get() invalid column '. get_class($this) .'::'. $col .' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
                 return false;
             }
         }
 
-        ###  Must be installed and active
-        if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
-            trigger_error( 'Call to get() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
-            return false;
-        }
+#        ###  Must be installed and active
+#        if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
+#            trigger_error( 'Call to get() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+#            return false;
+#        }
 
         ###  Get all the data if it's not already cached...
         if ( $this->table && empty( $this->data ) && ( is_null($this->obj_state) || $this->obj_state == 'active' ) ) {
@@ -426,7 +441,7 @@ class SimpleORM {
         $return_ary = array();
         foreach ($columns as $col) {
             ###  Prefer data columns first (in case people define a relation the same name as a column --> POSSIBLE INFINITE LOOP)
-            if ( array_key_exists($col, $this->schema) ) { $return_ary[] = $this->data[$col]; }
+            if ( isset($this->schema[$col]) ) { $return_ary[] = $this->data[$col]; }
             ###  Otherwise handle relation access
             else                                         { $return_ary[] = $this->get_relation( $col ); }
         }
@@ -453,7 +468,7 @@ class SimpleORM {
         
         ###  Check out the column names
         foreach (array_keys($to_set) as $col) {
-            if ( !    array_key_exists($col, $this->schema) ) {
+            if ( !    isset($this->schema[$col]) ) {
                 trigger_error( 'Call to set() invalid column '. get_class($this) .'::'. $col . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
                 return false;
             }
@@ -462,11 +477,11 @@ class SimpleORM {
         ###  Get all the data if it's not already cached...
         if ( empty( $this->data ) ) $this->get($this->primary_key[0]);
 
-        ###  Must be installed and active
-        if ( ! $this->exists() && $this->obj_state != 'active' ) {
-            trigger_error( 'Call to set() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
-            return false;
-        }
+#        ###  Must be installed and active
+#        if ( ! $this->exists() && $this->obj_state != 'active' ) {
+#            trigger_error( 'Call to set() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+#            return false;
+#        }
         
         ###  Set the new values in $this->data
         foreach (array_keys($to_set) as $col) {
@@ -481,13 +496,24 @@ class SimpleORM {
         END_TIMER('SimpleORM set', ORM_SQL_PROFILE);
         return true;
     }
-    public function remember_old_values() { return false; }
+    public function remember_old_values($set = null) {
+		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( is_null($set) ) { return( $this->__remember_old_values ); }
+		else { $this->__remember_old_values = $set; return $this->__remember_old_values; }
+	}
     /** 
      * unsaved_columns() - Get a quick list of the cols that have been locally {@link set()}, but not yet saved using {@link save()}
      */
     public function unsaved_columns() {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         return $this->columns_to_save;
+    }
+
+    public function column_has_changed( $col ) {
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        return( isset( $this->data['__old__'] ) && array_key_exists( $col, $this->data['__old__'] ) && array_key_exists(  $col, $this->data )
+                && (   $this->data['__old__'][ $col ] != $this->data[ $col ] ) ? true : false
+                );
     }
 
     public function get_table() {
@@ -512,8 +538,9 @@ class SimpleORM {
 
         ###  Must be installed and active
         if ( ! $this->exists() && $this->obj_state != 'active' ) {
-            trigger_error( 'Call to save() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
-            return false;
+#            trigger_error( 'Call to save() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+#            return false;
+			return $this->create(array());
         }
         if ( empty( $this->columns_to_save ) ) return true;
         
@@ -559,16 +586,16 @@ class SimpleORM {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         $caller_funcs_to_ignore = array('get_relation','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
 
-        ###  Must be installed and active
-        if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
-            trigger_error( 'Call to get_relation() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
-            return false;
-        }
+#        ###  Must be installed and active
+#        if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
+#            trigger_error( 'Call to get_relation() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
+#            return false;
+#        }
         ###  Return the cached answer if it's there
         if ( isset( $this->relation_data[$name] ) ) return( $force_ordered_list && is_array( $this->relation_data[$name] ) ? array_values( $this->relation_data[$name] ) : $this->relation_data[$name] );
 
         ###  Must have a definition
-        if ( ! array_key_exists($name, $this->relations) ) {
+        if ( ! isset($this->relations[$name]) ) {
             trigger_error( 'Use of invalid relation '. get_class($this) .'::'. $name . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
@@ -606,25 +633,45 @@ class SimpleORM {
             else                                        { $foreign_pkey = array( $rel['foreign_table_pkey'] ); }
             
             if ( is_null( $this->dbh ) ) $this->load_dbh();
-            $values = array();
-            $where = array();  foreach ($fk_columns as $i => $col) { $where[] = "$col = ?";  $values[] = $this->pk_values[$this->primary_key[$i]]; }
-            if ( ! empty($rel['custom_where_clause']) ) $where[] = $rel['custom_where_clause'];
-            $sql = "SELECT *
+
+			///  Handle custom hook for 
+			if ( ! empty($rel['custom_query_hook']) ) {
+				$hook = $rel['custom_query_hook'];
+				if ( is_array( $hook ) && $hook[0] == 'THIS' ) {
+					$hook[0] = $this;
+				}
+				$data = call_user_func_array($hook, array($rel));
+			} else {
+				///  Allow overriding of the Join-From Local columns
+				$join_vals = false;
+				if ( ! empty( $rel['local_columns'] ) ) {
+					$join_vals = array();
+					foreach ( (is_array($rel['local_columns']) ? $rel['local_columns'] : array($rel['local_columns']) ) as $col ) {
+						$join_vals[] = $this->$col;
+					}
+				}
+
+				$values = array();
+				$where = array();  foreach ($fk_columns as $i => $col) { $where[] = "$col = ?";  $values[] = ($join_vals) ? $join_vals[$i] : $this->pk_values[$this->primary_key[$i]]; }
+				if ( ! empty($rel['custom_where_clause']) ) $where[] = $rel['custom_where_clause'];
+				$sql = "SELECT *
                       FROM ". $rel['foreign_table'] ."
                      ". ((! empty($where)                  ) ? "WHERE ". join(' AND ', $where)      : "") ."
                      ". ((! empty($rel['order_by_clause']) ) ? "ORDER BY ". $rel['order_by_clause'] : "") ."
                       "; # " DUMB emacs PHP syntax hiliting
-            $sth = dbh_query_bind($sql, $values);
+				$sth = dbh_query_bind($sql, $values);
 
-            $class = $rel['class'];
-            if ( ! class_exists($class) ) require_once($this->include_prefix() . $rel['include']);
+				###  Get the data and convert it into an array of objects...
+				$data = $sth->fetchAll(PDO::FETCH_ASSOC);
+			}
 
-            ###  Get the data and convert it into an array of objects...
-            $data = $sth->fetchAll(PDO::FETCH_ASSOC);
+			$class = $rel['class'];
+			if ( ! class_exists($class) ) require_once($this->include_prefix() . $rel['include']);
+
             $obj_list = array();
             foreach ( $data as $row ) {
                 $pkey_vals = array();  foreach ($foreign_pkey as $col) { $pkey_vals[] = $row[$col]; }
-                $obj_list[] = new $class ($pkey_vals,$row);
+                $obj_list[join('||--||',$pkey_vals)] = new $class ($pkey_vals,$row);
             }
 
             $this->relation_data[$name] = $obj_list;
@@ -638,8 +685,25 @@ class SimpleORM {
             $rel_pk_values = array();
             $are_null_values = false;
 
-            if ( is_array($rel['foreign_table_pkey']) ) { $foreign_pkey =        $rel['foreign_table_pkey']; }
-            else                                        { $foreign_pkey = array( $rel['foreign_table_pkey'] ); }
+			$ft_join_clause = 'USING';
+			$using_clause = array();
+			$on_clause    = array();
+			foreach ( (array) $rel['foreign_table_pkey'] as $key => $col ) {
+				if ( is_int($key) ) {
+					$using_clause[] = $col;
+					$on_clause[]    = "jt.$col = ft.$col";
+				}
+				else {
+					$ft_join_clause = 'ON';
+					$on_clause[]    = "jt.$key = ft.$col";
+				}
+			}
+			
+			###  If the column names in the Join table aren't the same as they are in my table
+			$pkey_columns_in_join_table = $this->primary_key;
+			if ( ! empty( $rel['pkey_columns_in_join_table'] ) ) {
+				$pkey_columns_in_join_table = (array) $rel['pkey_columns_in_join_table'];
+			}
 
             ###  If there are any 'join_table_fixed_values'
             $join_table_fixed_values = array();
@@ -648,25 +712,35 @@ class SimpleORM {
             }
             
             if ( is_null( $this->dbh ) ) $this->load_dbh();
-            $values = array();
-            $where = array();  foreach ($this->pk_values         as $col => $val) { $where[] = "jt.$col = ?";  $values[] = $val; }
-            foreach                    ($join_table_fixed_values as $col => $val) { $where[] = "jt.$col = ?";  $values[] = $val; }
-            if ( ! empty($rel['custom_where_clause']) )        $where[] = $rel['custom_where_clause'];
-            if ( isset($rel['change_status_instead_of_delete'])
-                 && $rel['change_status_instead_of_delete']  ) $where[] = "jt.status = 'active'";
-            $sql = "SELECT ft.*
+
+			if ( ! empty($rel['custom_query_hook']) ) {
+				$hook = $rel['custom_query_hook'];
+				if ( is_array( $hook ) && $hook[0] == 'THIS' ) {
+					$hook[0] = $this;
+				}
+				$data = call_user_func_array($hook, array($rel));
+			} else {
+				$values = array();
+				$where = array();  foreach ($pkey_columns_in_join_table as $i => $col) { $where[] = "jt.$col = ?";  $values[] = $this->pk_values[$this->primary_key[$i]]; }
+				foreach                     ($join_table_fixed_values as $col => $val) { $where[] = "jt.$col = ?";  $values[] = $val; }
+				if ( ! empty($rel['custom_where_clause']) )        $where[] = $rel['custom_where_clause'];
+				if ( isset($rel['change_status_instead_of_delete'])
+					 && $rel['change_status_instead_of_delete']  ) $where[] = "jt.status = 'active'";
+				$sql = "SELECT ft.*
                       FROM ". $rel['join_table'] ." jt 
-                      JOIN ". $rel['foreign_table'] ." ft USING(". join(', ', $foreign_pkey) .") 
+                      JOIN ". $rel['foreign_table'] ." ft ". $ft_join_clause ."(". ( $ft_join_clause == 'USING' ? join(', ', $using_clause) : join(' AND ', $on_clause) ) .") 
                       ". ((! empty($where)                  ) ? "WHERE ". join(' AND ', $where)      : "") ."
                       ". ((! empty($rel['order_by_clause']) ) ? "ORDER BY ". $rel['order_by_clause'] : "") ."
                       "; # " DUMB emacs PHP syntax hiliting
-            $sth = dbh_query_bind($sql, $values);
+				$sth = dbh_query_bind($sql, $values);
 
-            $class = $rel['class'];
-            if ( ! class_exists($class) ) require_once($this->include_prefix() . $rel['include']);
+				###  Get the data and convert it into an array of objects...
+				$data = $sth->fetchAll(PDO::FETCH_ASSOC);
+			}
 
-            ###  Get the data and convert it into an array of objects...
-            $data = $sth->fetchAll(PDO::FETCH_ASSOC);
+			$class = $rel['class'];
+			if ( ! class_exists($class) ) require_once($this->include_prefix() . $rel['include']);
+
             $obj_list = array();
             foreach ( $data as $row ) {
                 $pkey_vals = array();  foreach ($foreign_pkey as $col) { $pkey_vals[] = $row[$col]; }
@@ -703,7 +777,8 @@ class SimpleORM {
 
         $relation_key = is_array($pkey)?join('||--||',$pkey):$pkey;
 
-        return array_key_exists($relation_key,$this->get_relation($relation, false));
+		$ret = $this->get_relation($relation, false);
+        return isset($ret[$relation_key]);
     }
     /**
      * add_relation() - 
@@ -716,15 +791,23 @@ class SimpleORM {
     public function add_relation($relation, $pkey) {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         if($this->has_relation($relation, $pkey)) return true;
+#		bug('Didnt have relation in'. get_class($this) .'->'. $relation, $pkey, array_keys((array) $this->relation_data[$relation]));
         
-        if(!is_array($pkey)) $pkey = array($pkey);
-        $relation_key = join('||--||',$pkey);
+		###  Update relation_data so that further has_relation() calls are already cached
+        $relation_key = join('||--||',(array) $pkey);
         $rel = &$this->relations[$relation];
         $class = $rel['class'];
         $this->relation_data[$relation][$relation_key] = new $class ($pkey);
-        if ( is_array($rel['foreign_table_pkey']) ) { $foreign_pkey =        $rel['foreign_table_pkey']; }
-        else                                        { $foreign_pkey = array( $rel['foreign_table_pkey'] ); }
+        $foreign_pkey = (array) $rel['foreign_table_pkey'];
         
+		$pkey = (array) $pkey;
+
+		###  If the column names in the Join table aren't the same as they are in my table
+		$pkey_columns_in_join_table = $this->primary_key;
+		if ( ! empty( $rel['pkey_columns_in_join_table'] ) ) {
+			$pkey_columns_in_join_table = (array) $rel['pkey_columns_in_join_table'];
+		}
+		
         ###  If there are any 'join_table_fixed_values'
         $join_table_fixed_values = array();
         if ( isset($rel['join_table_fixed_values']) && is_array($rel['join_table_fixed_values']) ) {
@@ -733,12 +816,19 @@ class SimpleORM {
             
         if ( is_null( $this->dbh ) ) $this->load_dbh();
         $fields = array(); $q_marks = array(); $values = array();
-        foreach( $this->primary_key       as         $pk ) { $fields[] = $pk;  $q_marks[] = "?"; $values[] = $this->pk_values[$pk];}
-        foreach( $foreign_pkey            as $i   => $pk ) { $fields[] = $pk;  $q_marks[] = "?"; $values[] = array_key_exists($pk,$pkey)?$pkey[$pk]:$pkey[$i];}
-        foreach( $join_table_fixed_values as $col => $val) { $fields[] = $col; $q_marks[] = "?"; $values[] = $val;}
+        foreach( $pkey_columns_in_join_table as $i   => $pk    ) { $fields[] = $pk;  $q_marks[] = "?"; $values[] = $this->pk_values[$this->primary_key[$i]];}
+        foreach( array_keys($foreign_pkey)   as $i   => $jt_pk ) {
+			###  Handle custom col name for jt.<foreign pkey>, where
+			###    The key of the column is the join table column
+			$fields[] = is_int($jt_pk) ? $foreign_pkey[$jt_pk] : $jt_pk;
+			$q_marks[] = "?";
+			$values[] = array_key_exists($foreign_pkey[$jt_pk],$pkey) ? $pkey[$foreign_pkey[$jt_pk]] : $pkey[$i];
+		}
+        foreach( $join_table_fixed_values    as $col => $val   ) { $fields[] = $col; $q_marks[] = "?"; $values[] = $val;}
         $sql = "INSERT INTO ". $rel['join_table'] ." (". join(',',$fields) .") 
                 VALUES (". join(',', $q_marks).") ";
-        $sth = dbh_do_bind($sql, $values);
+
+		$sth = dbh_do_bind($sql, $values);
         
         return true;
     }
@@ -754,24 +844,33 @@ class SimpleORM {
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         if(!$this->has_relation($relation, $pkey)) return true;
         
-        if(!is_array($pkey)) $pkey = array($pkey);
-        $relation_key = join('||--||',$pkey);
+        $relation_key = join('||--||',(array) $pkey);
         $rel = &$this->relations[$relation];
         unset($this->relation_data[$relation][$relation_key]);
-        if ( is_array($rel['foreign_table_pkey']) ) { $foreign_pkey =        $rel['foreign_table_pkey']; }
-        else                                        { $foreign_pkey = array( $rel['foreign_table_pkey'] ); }
+        $foreign_pkey = (array) $rel['foreign_table_pkey'];
         
         ###  If there are any 'join_table_fixed_values'
         $join_table_fixed_values = array();
         if ( isset($rel['join_table_fixed_values']) && is_array($rel['join_table_fixed_values']) ) {
             $join_table_fixed_values = $rel['join_table_fixed_values'];
         }
+
+		###  If the column names in the Join table aren't the same as they are in my table
+		$pkey_columns_in_join_table = $this->primary_key;
+		if ( ! empty( $rel['pkey_columns_in_join_table'] ) ) {
+			$pkey_columns_in_join_table = (array) $rel['pkey_columns_in_join_table'];
+		}
             
         ###  Assemble the WHERE clause
         $values = array();
-        $where = array();  foreach ($this->pk_values         as $col => $val) { $where[] = "$col = ?";               $values[] = $val; }
-        foreach                    ($pkey                    as $i   => $val) { $where[] = $foreign_pkey[$i]." = ?"; $values[] = $val; }
-        foreach                    ($join_table_fixed_values as $col => $val) { $where[] = "$col = ?";               $values[] = $val; }
+		$where = array();  foreach ($pkey_columns_in_join_table as $i   => $col) { $where[] = "$col = ?";  $values[] = $this->pk_values[$this->primary_key[$i]]; }
+        foreach( array_keys($foreign_pkey)   as $i   => $jt_pk ) {
+			###  Handle custom col name for jt.<foreign pkey>, where
+			###    The key of the column is the join table column
+			$where[] = (is_int($jt_pk) ? $foreign_pkey[$jt_pk] : $jt_pk)." = ?"; 
+			$values[] = array_key_exists($foreign_pkey[$jt_pk],$pkey) ? $pkey[$foreign_pkey[$jt_pk]] : $pkey[$i];
+		}
+        foreach                    ($join_table_fixed_values    as $col => $val) { $where[] = "$col = ?";               $values[] = $val; }
         if ( ! empty($rel['custom_where_clause']) ) $where[] = $rel['custom_where_clause'];
 
         ###  Assemble the SQL, (either UDPATE or DELETE)
@@ -814,7 +913,7 @@ class SimpleORM {
         foreach($pkeys as $pkey) {
             $relation_key = is_array($pkey)?join('||--||',$pkey):$pkey;
             ##  Skip ones already set and in to_set
-            if(array_key_exists($relation_key,$old_relations)) {
+            if ( isset($old_relations[$relation_key])) {
                 unset($old_relations[$relation_key]);
             } 
             ## Set ones not already set but need to be
@@ -827,8 +926,25 @@ class SimpleORM {
             $pkey = explode('||--||',$key);
             $this->remove_relation($relation,$pkey);
         }
-        
         return true;
+    }
+    /**
+     * get_complete_relation() - 
+     * 
+     * for has_many and many_to_many relationships only.  Returns the list of the pkeys only, not ORM objects
+     *
+     * As this joins pkeys with the internal delimiter ||--||, this is mainly only useful if the 
+     * pkey is a single column...
+     *
+     * $relation - the name of the relation
+     * $pkeys - an array of the primary key values of the other objects
+     */
+    public function get_complete_relation($relation) {
+#        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        
+        $relations = $this->get_relation($relation, false);
+        if ( empty( $relations ) ) return( array() );
+        return( array_keys( $relations ) );
     }
     /**
      * clear_relation_cache() - clear just relation cache, but not column data
@@ -867,16 +983,19 @@ class SimpleORM {
      * Also adds the object to the cache after a successful insert.
      *
      */
-    public function create($to_set) {
+    public function create($to_set = array()) {
         global $SimpleORM_OBJECT_CACHE;
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
-        $caller_funcs_to_ignore = array('create','exists','call_user_func_array','do_object_forward_method');
+        $caller_funcs_to_ignore = array('create','exists','set','set_and_save','call_user_func_array','do_object_forward_method');
     
         ###  Must be not installed
         if ( $this->exists() || $this->obj_state != 'not_created' ) {
             trigger_error( 'Call to create() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
+
+		###  Merge in any params they have previously set()
+		foreach (array_keys($this->columns_to_save) as $col) { if ( ! array_key_exists( $col, $to_set ) ) $to_set[$col] = $this->data[$col]; }
 
         ###  Check in advance that we will be able to get the new Primary Key values...
         if ( $this->dbh_type == 'pg' ) {
@@ -905,17 +1024,20 @@ class SimpleORM {
                 $this->pk_values[$col] = $to_set[$col];
             }
             else if ( $this->dbh_type == 'pg' && isset($this->column_sequences[$col]) ) {
-                $this->pk_values[$col] = $this->dbh->lastInsertId($this->column_sequences[$col]);
+                $this->pk_values[$col] = $this->dbh()->lastInsertId($this->column_sequences[$col]);
             }
             else if ( $this->dbh_type != 'pg' ) {
-                $this->pk_values[$col] = $this->dbh->lastInsertId();
+                $this->pk_values[$col] = $this->dbh()->lastInsertId();
             }
             ###  (PostgreSQL only) Already checking for the 'else' above BEFORE the insert is done...
             else {
                 trigger_error( 'What the?'. get_class($this) .'::'. $col . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             }
         }
+		$this->data = array(); //  Force them to re-get() to get the default values, PKey, etc.
         $this->obj_state = null;
+        $this->columns_to_save = array();
+        if ( isset( $this->data['__old__'] ) ) unset( $this->data['__old__'] );
         
         ###  Add to cache
         $pk_string = array();  foreach ($this->primary_key as $col) { $pk_string[] = $this->pk_values[$col]; }
@@ -935,6 +1057,33 @@ class SimpleORM {
      */
     protected function post_create_handler($to_set) { return true; }
 
+    /** 
+     * get_all() - Quick get all columns
+     */
+	public function get_all() {
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+
+		$data = array();
+		foreach ( $this->schema as $col => $x ) { $data[$col] = $this->get($col); }
+		return $data;
+	}
+
+    /** 
+     * clone() - Quick copy of all (currently-set) data in a ready-to-create un-installed object of the same class
+     */
+	public function clone_row() {
+        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+
+		$class = get_class($this);
+		$my_clone = new $class(array());
+
+		$data = array();
+		foreach ( $this->schema as $col => $x ) { if ( ! in_array($col, $this->primary_key) ) $data[$col] = $this->get($col); }
+		$my_clone->set($data);
+		
+		return $my_clone;
+	}
+
 
     #########################
     ###  Delete
@@ -948,7 +1097,7 @@ class SimpleORM {
         global $SimpleORM_OBJECT_CACHE;
         if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
         $caller_funcs_to_ignore = array('delete','exists','call_user_func_array','do_object_forward_method');
-
+    
         ###  Must be installed and active
         if ( ! is_null($this->obj_state) && $this->obj_state != 'active' ) {
             trigger_error( 'Call to delete() on a "'. get_class($this) .'" object that is "'. $this->obj_state .'" in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
@@ -974,7 +1123,7 @@ class SimpleORM {
         
         ###  Free up the cache item, Any other objects that are still object_forwarded
         ###    to this will also now appear "deleted".  If you're messy, this can bite you!
-        if ( array_key_exists($this->cache_key, $SimpleORM_OBJECT_CACHE ) ) {
+        if ( isset($SimpleORM_OBJECT_CACHE[$this->cache_key] ) ) {
             unset( $SimpleORM_OBJECT_CACHE[$this->cache_key] );
         }
             
@@ -1026,7 +1175,7 @@ class SimpleORM {
 #        if ( isset( $this->relation_data[$name] ) ) return( $force_ordered_list && is_array( $this->relation_data[$name] ) ? array_values( $this->relation_data[$name] ) : $this->relation_data[$name] );
 
         ###  Must have a definition
-        if ( ! array_key_exists($name, $this->relations) ) {
+        if ( ! isset($this->relations[$name]) ) {
             trigger_error( 'Use of invalid relation '. get_class($this) .'::'. $name . ' in '. trace_blame_line($caller_funcs_to_ignore), E_USER_ERROR);
             return false;
         }
@@ -1059,7 +1208,7 @@ class SimpleORM {
         $seen = array(get_class($this)); // Don't crawl back to THIS object...
         $sub_tables = array( 'alias_letters' => range('a','z'),
                              'aliases' => array( 'primary' => $class ),
-                             'pkeys'   => array( 'primary' => ( is_array( $this->primary_key ) ? $this->primary_key : array( $this->primary_key ) ) ),
+                             'pkeys'   => array( 'primary' => $foreign_pkey ),
                              'joins'   => array( "FROM ". $rel['foreign_table'] ),
                              'selects' => array( $alias .'.*' ),
                              );
@@ -1074,8 +1223,8 @@ class SimpleORM {
                  ". ((! empty($where)                  ) ? "WHERE ". join(' AND ', $where)      : "") ."
                  ". ((! empty($rel['order_by_clause']) ) ? "ORDER BY ". $rel['order_by_clause'] : "") ."
                   "; # " DUMB emacs PHP syntax hiliting
-        if (ORM_SQL_DEBUG) trace_dump();
-        if (ORM_SQL_DEBUG) bug($sql, $values);
+        if (SQL_DEBUG) trace_dump();
+        if (SQL_DEBUG) bug($sql, $values);
         $sth = dbh_query_bind($sql, $values);
 
 
@@ -1142,7 +1291,6 @@ class SimpleORM {
             $sub_alias = str_repeat( array_shift( $sub_tables['alias_letters'] ), 4 );
             $sub_tables['aliases'][ $sub_alias ] = $sub_class;
 
-
             $local_pkey   = $rel['columns'];              if ( ! is_array($local_pkey) )   $local_pkey   = array( $local_pkey );
             $foreign_pkey = $sub_obj->get_primary_key();  if ( ! is_array($foreign_pkey) ) $foreign_pkey = array( $foreign_pkey );
             $on_clause = array();  foreach ( $local_pkey as $i => $col ) $on_clause[] = ( $alias .'.'. $local_pkey[$i] .' = '. $sub_alias .'.'. $foreign_pkey[$i] );
@@ -1164,12 +1312,28 @@ class SimpleORM {
     #########################
     ###  Virtual members for getting / setting each column name
     
-    ###  These just use get() and set(), so they are "object_forward" safe
-    public function __get($name)         { return $this->get($name); }
-    public function __set($name, $value) { return $this->set(array($name => $value)); }
-    public function __isset($name)       { return ! is_null($this->get($name)); }
-    public function __unset($name)       { $this->set(array($name => null)); }
-
+    ###  These just use get() and set()
+	public function __get($name) {
+		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( isset( $this->schema[$name] ) || isset( $this->relations[$name] ) )   return $this->get($name);
+		else if ( isset( $this->$name ) ) return $this->$name; // allow user-set parameters, but on the Singleton object
+	}
+    public function __set($name, $value) {
+		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( isset( $this->schema[$name] ) || isset( $this->relations[$name] ) )  return $this->set(array($name => $value));
+		else return( $this->$name = $value ); // allow user-set parameters, but on the Singleton object
+	}
+    public function __isset($name) {
+		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( isset( $this->schema[$name] ) || isset( $this->relations[$name] ) )  return( ! is_null($this->get($name)) );
+		else return( isset( $this->$name ) ); // allow user-set parameters, but on the Singleton object
+	}
+	public function __unset($name) {
+		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( isset( $this->schema[$name] ) || isset( $this->relations[$name] ) )  return( $this->set(array($name => null)) );
+		else unset( $this->$name ); // allow user-set parameters, but on the Singleton object
+	}
+	
 
     #########################
     ###  Object Forwarding
@@ -1385,7 +1549,7 @@ function validate($form = null) {
     if ( is_null($form) ) $form = &$_REQUEST;
     $cols = array_slice( func_get_args(), 1 );
     $prefix = '';
-    ///  Schema will be an array of arrays as the last param...
+    ###  Schema will be an array of arrays as the last param...
     if ( count( $cols ) > 1
          && is_array(array_pop(array_values($cols)))
          && is_array(array_shift(array_pop(array_values($cols))))
@@ -1430,7 +1594,7 @@ function extract_and_validate($form = null) {
     if ( is_null($form) ) $form = &$_REQUEST;
     $cols = array_slice( func_get_args(), 1 );
     $prefix = '';
-    ///  Schema will be an array of arrays as the last param...
+    ###  Schema will be an array of arrays as the last param...
     if ( count( $cols ) > 1
          && is_array(array_pop(array_values($cols)))
          && is_array(array_shift(array_pop(array_values($cols))))
@@ -1530,6 +1694,8 @@ function do_validation( $col, $value, array $valhash ) {
     if ( ! empty($valhash['format']) && $valhash['format'] == 'bool'               && ( ! isset($value) || preg_match('/^(f|false|n|no|0)$/i', $value) != 0 ) )  $value = false;
     if ( ! empty($valhash['format']) && $valhash['format'] == 'bool'               &&     isset($value) && preg_match('/^(t|true|y|yes|1)$/i', $value) != 0 )    $value = true;
     if ( ! empty($valhash['format']) && $valhash['format'] == 'credit_card_number' && (!  empty($value)) ) $value = preg_replace('/[\s\-]/',   '', $value);
+    if ( ! empty($valhash['format']) && $valhash['format'] == 'date'               && (!  empty($value)) ) { $value = strtotime($value); $value = empty($value) ? 'invalid date' : date('Y-m-d',       $value); }
+    if ( ! empty($valhash['format']) && $valhash['format'] == 'datetime'           && (!  empty($value)) ) { $value = strtotime($value); $value = empty($value) ? 'invalid date' : date('Y-m-d H:i:s', $value); }
     ###  If 'not_empty_string', then turn into null
     if ( ! empty($valhash['not_empty_string'])                  && isset($value) && strlen($value) == 0 ) $value = null;
 
@@ -1674,10 +1840,11 @@ function dbh_query_bind( $sql ) {
     ###  Allow params passed in an array or as args
     if ( is_a( $bind_params[ count($bind_params) - 1 ], 'PDO' ) || is_a( $bind_params[ count($bind_params) - 1 ], 'PhoneyPDO' ) ) $use_dbh = array_pop($bind_params);
     if ( ! isset( $GLOBALS['orm_dbh'] ) ) $GLOBALS['orm_dbh'] = $use_dbh; # steal their DBH for global use, hehehe
-    if ( count( $bind_params ) == 1 && is_array(array_shift(array_values($bind_params))) ) { $bind_params = array_shift(array_values($bind_params)); };
-#    if (ORM_SQL_DEBUG) trace_dump();
+    if ( count( $bind_params ) == 1 && ( $tmp = array_values($bind_params) ) && is_array($tmp[0]) ) { $bind_params = $tmp[0]; };
     reverse_t_bools($bind_params);
+    if (ORM_SQL_DEBUG) trace_dump();
     if (ORM_SQL_DEBUG) bug($sql, $bind_params);
+    $GLOBALS['ORM_SQL_LOG'][] = array(microtime(true), $sql, $bind_params);
     try { 
         $sth = $use_dbh->prepare($sql);
         $rv = $sth->execute($bind_params);
@@ -1712,6 +1879,7 @@ function dbh_do_bind( $sql ) {
     
     reverse_t_bools($bind_params);
     if (ORM_SQL_DEBUG || ORM_SQL_WRITE_DEBUG) bug($sql, $bind_params);
+    $GLOBALS['ORM_SQL_LOG'][] = array(microtime(true), $sql, $bind_params);
     try { 
         $sth = $use_dbh->prepare($sql);
         $rv = $sth->execute($bind_params);
