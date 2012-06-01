@@ -697,7 +697,9 @@ class SimpleORM {
 			$ft_join_clause = 'USING';
 			$using_clause = array();
 			$on_clause    = array();
+			$foreign_pkey = array();
 			foreach ( (array) $rel['foreign_table_pkey'] as $key => $col ) {
+				$foreign_pkey[] = $col;
 				if ( is_int($key) ) {
 					$using_clause[] = $col;
 					$on_clause[]    = "jt.$col = ft.$col";
