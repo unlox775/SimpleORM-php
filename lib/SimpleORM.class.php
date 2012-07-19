@@ -9,6 +9,7 @@ define('ORM_SQL_DEBUG',   false );
 define('ORM_SQL_WRITE_DEBUG', false);
 
 $GLOBALS['SimpleORM_OBJECT_CACHE'] = array();
+$GLOBALS['SimpleORM_OBJECT_REFCOUNT'] = array();
 $GLOBALS['SimpleORM_DBH_CACHE'] = array();
 $GLOBALS['ORM_SQL_LOG'] = array();
 
@@ -130,7 +131,7 @@ $GLOBALS['ORM_SQL_LOG'] = array();
  * access object variables, include this line as the first line of
  * the method code:
  *
- * <code>if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();</code>
+ * <code>if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);</code>
  *
  * This just quickly checks if the object is a forwarded object
  * and the {@link do_object_forward_method()} method takes care of the
@@ -260,6 +261,9 @@ class SimpleORM {
     protected $cache_key = null;
     protected $obj_state = null;
     protected $__remember_old_values = false;
+	public $__opt_mode = null;
+	private static $__global_opt_mode = 'p';
+	private static $__opt_mode_getting_parent = false;
 
     /** 
      * __construct
@@ -285,7 +289,6 @@ class SimpleORM {
      * @param mixed $select_star_data    If you got the PKey from a SQL query you just ran and you also got the full "select * from ..." for that table row, just pass that (assoc) array here and it'll save SimplORM from having to re-query the data
      */
     public function __construct($pk_value = array(), $select_star_data = null, $sync_dbh = null) {
-        global $SimpleORM_OBJECT_CACHE;
 
         ###  Handle one or an array or PK values
         if ( is_array( $pk_value ) ) {
@@ -293,11 +296,6 @@ class SimpleORM {
         }
         else { $this->pk_values[$this->primary_key[0]] = $pk_value; }
 
-        ###  Allow them to supply a "SELECT * " output for this row if they already had it...
-        if ( is_array( $select_star_data ) ) {
-            ###  For now, just trust it...  Maybe later we'll make it check that all the cols are present...
-            $this->data = $select_star_data;
-        }
 		###  For when you KNOW the DBH ID, like for internal object creation...
         if ( is_int( $sync_dbh ) ) {
             $this->dbh = $sync_dbh;
@@ -308,19 +306,110 @@ class SimpleORM {
         $pk_string = array();  foreach ($this->primary_key as $col) { if ( ! isset($this->pk_values[$col]) || is_null($this->pk_values[$col]) ) $has_null_pk_values = true;  $pk_string[] = $this->pk_values[$col]; }
 		if ( is_null( $this->dbh ) ) $this->load_dbh();
         if ( ! $has_null_pk_values ) {
-            $this->cache_key = get_class($this). '||--||'. $this->table .'||--||'. join('||--||', $pk_string); 
-			if ( isset($SimpleORM_OBJECT_CACHE[ $this->dbh ][ $this->cache_key ]) ) {
-                $this->object_forward = $SimpleORM_OBJECT_CACHE[ $this->dbh ][$this->cache_key];
+            $this->cache_key = get_class($this). '||--||'. $this->table .'||--||'. join('||--||', $pk_string);
+
+			###  For memory opt_mode, it may get the object in advance so that this object
+			###    will be guaranteed to be an object_forward child
+			$this->opt_mode_preload(func_get_args());
+
+			if ( SimpleORM::$__global_opt_mode != 'n' && isset($GLOBALS['SimpleORM_OBJECT_CACHE'][ $this->dbh ][ $this->cache_key ]) ) {
+                $this->object_forward = true;
 #				bug("USING CACHE: ".$this->cache_key);
             
                 ###  Blank out some $this data to save memory
-                unset($this->data, $this->table, $this->schema, $this->relations, $this->primary_key, $this->pk_values, $this->dbh, $this->columns_to_save, $this->obj_state, $this->cache_key );
+                unset($this->data, $this->table, $this->schema, $this->relations, $this->primary_key, $this->pk_values, $this->columns_to_save, $this->obj_state );
+				$this->__opt_mode = $GLOBALS['SimpleORM_OBJECT_CACHE'][ $this->dbh ][$this->cache_key]->__opt_mode;
             }
-            else { $SimpleORM_OBJECT_CACHE[ $this->dbh ][$this->cache_key] = $this; }
+            else {
+				if ( SimpleORM::$__global_opt_mode != 'n' ) $GLOBALS['SimpleORM_OBJECT_CACHE'][ $this->dbh ][$this->cache_key] = $this;
+				$this->__opt_mode = SimpleORM::$__global_opt_mode;
+			}
+
+			if ( $this->__opt_mode == 'm' && $this->object_forward !== null ) @$GLOBALS['SimpleORM_OBJECT_REFCOUNT'][ $this->dbh ][$this->cache_key]++;
         }
         ###  Otherwise, they called it with none or not enough PKey params, so they must be plannin on calling ->create() later...
         else $this->obj_state = 'not_created';
+
+        ###  Allow them to supply a "SELECT * " output for this row if they already had it...
+        if ( $this->object_forward === null && is_array( $select_star_data ) ) {
+            ###  For now, just trust it...  Maybe later we'll make it check that all the cols are present...
+            $this->data = $select_star_data;
+        }
     }
+
+	public function __clone() {
+        START_TIMER('SimpleORM __clone() of '. ($this->object_forward ? 'forward' : 'parent'), ORM_SQL_PROFILE);
+		if ( $this->__opt_mode == 'm' ) @$GLOBALS['SimpleORM_OBJECT_REFCOUNT'][ $this->dbh ][$this->cache_key]++;
+        END_TIMER('SimpleORM __clone() of '. ($this->object_forward ? 'forward' : 'parent'), ORM_SQL_PROFILE);
+	}
+
+	public function __destruct() {
+        START_TIMER('SimpleORM __destruct() of '. ($this->object_forward ? 'forward' : 'parent'), ORM_SQL_PROFILE);
+		if ( $this->__opt_mode == 'm' ) {
+			if ( $this->object_forward !== null ) $GLOBALS['SimpleORM_OBJECT_REFCOUNT'][ $this->dbh ][$this->cache_key]--;
+			if ( $GLOBALS['SimpleORM_OBJECT_REFCOUNT'][ $this->dbh ][$this->cache_key] <= 0 ) {
+				$GLOBALS['SimpleORM_OBJECT_CACHE'][ $this->dbh ][ $this->cache_key ] = null;
+				unset( $GLOBALS['SimpleORM_OBJECT_CACHE'][ $this->dbh ][ $this->cache_key ] );
+			}
+		}
+        END_TIMER('SimpleORM __destruct() of '. ($this->object_forward ? 'forward' : 'parent'), ORM_SQL_PROFILE);
+	}
+
+	/* optimization_mode()
+	 *
+	 * Gets or Sets the Optimization Mode.
+	 *
+	 * By default SimpleORM is set to acheive hightest performance.
+	 * much of this comes by selecting a little as possible, but trying
+	 * hardest to not have to re-select any data that has already been
+	 * selected.  Thie means for example, that if you get "new MyObj(5)"
+	 * amd let that object fall out of scope, that a second "new MyObj(5)"
+	 * will not need to run a SQL query again to get the data.
+	 * 
+	 * The disdvantage however, is that memory usage for SimpleORM usally
+	 * only increases.  This is usually managed for web applications by
+	 * doing less operations and cutting down on unnecessary objects being
+	 * used.  However, for long-running daemons or data processing
+	 * applications, this can be a serious problem.
+	 *
+	 * The other mode is 'memory', which allows for garbage collection
+	 * of any objects who's last reference has fallen out of scope.
+	 *
+	 * NOTE: the performance mode is set globally, but each object cache's
+	 * the current mode at the instant of __construct(), In this way you can
+	 * be selective of which objects you want garbage-collected or not.
+	 *
+	 * The return value is the current or new mode.
+	 *
+     * @param mixed $mode          Either 'p' for performance, 'm' for memory, or 'n' for no-singleton.  If not passed, it gets the current value and does not change the mode
+	 */
+	public static function optimization_mode($mode = null) {
+		if ( ! is_null( $mode ) )
+			SimpleORM::$__global_opt_mode = substr($mode, 0, 1);
+		return SimpleORM::$__global_opt_mode;
+	}
+
+	private function opt_mode_preload($args) {
+		$class = get_class($this);
+		###  Avoid infinite loops on the same __construct()
+		if ( SimpleORM::$__global_opt_mode != 'm'
+			 || isset($GLOBALS['SimpleORM_OBJECT_CACHE'][ $this->dbh ][ $this->cache_key ])
+			 || ( ! empty( SimpleORM::$__opt_mode_getting_parent ) && isset( SimpleORM::$__opt_mode_getting_parent[ $this->cache_key ] )
+				  ) ) return false;
+
+		###  Since call_user_func_array() doesn't handle "new Object()", then we have to be sneaky...
+		SimpleORM::$__opt_mode_getting_parent[ $this->cache_key ] = true;
+		switch (count($args)) {
+		    case 0: $obj = new $class(); break;
+		    case 1: $obj = new $class($args[0]); break;
+		    case 2: $obj = new $class($args[0],$args[1]); break;
+		    case 3: $obj = new $class($args[0],$args[1],$args[2]); break;
+		    case 4: $obj = new $class($args[0],$args[1],$args[2],$args[3]); break;
+		}
+		###  That should have cached the object in the ORM cache, so the caller __construct() will be an object_forward
+		unset( SimpleORM::$__opt_mode_getting_parent[ $this->cache_key ] );
+	}
+
     ///  Wait as late as possible to get the DBH...
     protected function load_dbh() {
         ###  Get the database handle
@@ -350,7 +439,7 @@ class SimpleORM {
      * Returns false if the object state is either 'not_created' or 'deleted', otherwise the state must be 'active' and it returns true
      */
     public function exists() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         if ( $this->obj_state == 'not_created' || $this->obj_state == 'deleted') return false;
         return ( $this->obj_state == 'active' || ! is_null($this->get($this->primary_key[0])) );
     }
@@ -365,7 +454,7 @@ class SimpleORM {
      * @see clear_relation_cache()
      */
     public function reset_state() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $this->data = array();
         $this->obj_state = null;
         $this->clear_relation_cache();
@@ -379,7 +468,7 @@ class SimpleORM {
      * dbh() - Quick access to the actual PDO database handle
      */
     public function dbh() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 		
         if ( is_null( $this->dbh ) ) $this->load_dbh();
         return $GLOBALS['SimpleORM_DBH_CACHE'][ $this->dbh ];
@@ -395,7 +484,7 @@ class SimpleORM {
      * @param mixed $arg1    Either an array of column or relation names, a single name, or multiple names passed as arguments (not as an array) e.g. $my_user->get('name','email','birthday')
      */
     public function get($arg1) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $caller_funcs_to_ignore = array('get','__get','get_relation','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
         START_TIMER('SimpleORM get', ORM_SQL_PROFILE);
 
@@ -465,7 +554,7 @@ class SimpleORM {
      * @see set_and_save()
      */
     public function set($to_set) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $caller_funcs_to_ignore = array('set','set_and_save','__set','__unset','exists','call_user_func_array','do_object_forward_method');
         START_TIMER('SimpleORM set', ORM_SQL_PROFILE);
 
@@ -502,7 +591,7 @@ class SimpleORM {
         return true;
     }
     public function remember_old_values($set = null) {
-		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 		if ( is_null($set) ) { return( $this->__remember_old_values ); }
 		else { $this->__remember_old_values = $set; return $this->__remember_old_values; }
 	}
@@ -510,27 +599,27 @@ class SimpleORM {
      * unsaved_columns() - Get a quick list of the cols that have been locally {@link set()}, but not yet saved using {@link save()}
      */
     public function unsaved_columns() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         return $this->columns_to_save;
     }
 
     public function column_has_changed( $col ) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         return( isset( $this->data['__old__'] ) && array_key_exists( $col, $this->data['__old__'] ) && array_key_exists(  $col, $this->data )
                 && (   $this->data['__old__'][ $col ] != $this->data[ $col ] ) ? true : false
                 );
     }
 
     public function get_table() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         return $this->table;
     }
     public function get_primary_key() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         return $this->primary_key;
     }
     public function get_relations() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         return $this->relations;
     }
 
@@ -542,7 +631,7 @@ class SimpleORM {
      * save() - Take all the columns set locally, and send an UPDATE to the database
      */
     public function save() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $caller_funcs_to_ignore = array('save','set_and_save','exists','call_user_func_array','do_object_forward_method');
 
         ###  Must be installed and active
@@ -592,7 +681,7 @@ class SimpleORM {
      * get_relation() - Directly get a relation, can also be done with get()
      */
     public function get_relation($name, $force_ordered_list = true) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $caller_funcs_to_ignore = array('get_relation','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
 
 #        ###  Must be installed and active
@@ -778,7 +867,7 @@ class SimpleORM {
      * $pkey - an array of the primary key values of the other object
      */
     public function has_relation($relation, $pkey) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $caller_funcs_to_ignore = array('set_complete_relation', 'get_relation','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
         ###  Must be many to many
         if ( $this->relations[$relation]['relationship'] != 'many_to_many' )  {
@@ -800,7 +889,7 @@ class SimpleORM {
      * $pkey - an array of the primary key values of the other object
      */
     public function add_relation($relation, $pkey) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         if($this->has_relation($relation, $pkey)) return true;
         
 #        bug('Didnt have relation in'. get_class($this) .'->'. $relation, $pkey, array_keys((array) $this->relation_data[$relation]));
@@ -853,7 +942,7 @@ class SimpleORM {
      * $pkey - an array of the primary key values of the other object
      */
     public function remove_relation($relation, $pkey) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         if(!$this->has_relation($relation, $pkey)) return true;
         
         $relation_key = join('||--||',(array) $pkey);
@@ -916,7 +1005,7 @@ class SimpleORM {
      * $pkeys - an array of the primary key values of the other objects
      */
     public function set_complete_relation($relation, $pkeys) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 
         ###  This call is expensive enough, clear relation cache before to assure reliability...
         unset($this->relation_data[$relation]);
@@ -952,7 +1041,7 @@ class SimpleORM {
      * $pkeys - an array of the primary key values of the other objects
      */
     public function get_complete_relation($relation) {
-#        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+#        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         
         $relations = $this->get_relation($relation, false);
         if ( empty( $relations ) ) return( array() );
@@ -962,9 +1051,11 @@ class SimpleORM {
      * clear_relation_cache() - clear just relation cache, but not column data
      */
     public function clear_relation_cache() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
+        START_TIMER('SimpleORM clear_relation_cache()', ORM_SQL_PROFILE);
         $this->post_clear_relation_cache_handler();
-        return $this->relation_data = array();
+        $this->relation_data = array();
+        END_TIMER('SimpleORM clear_relation_cache()', ORM_SQL_PROFILE);
     }
     /** 
      * post_clear_relation_cache_handler() - To be overridden by child-classes that have their own local caching
@@ -997,7 +1088,7 @@ class SimpleORM {
      */
     public function create($to_set = array()) {
         global $SimpleORM_OBJECT_CACHE;
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $caller_funcs_to_ignore = array('create','exists','set','set_and_save','call_user_func_array','do_object_forward_method');
     
         ###  Must be not installed
@@ -1073,7 +1164,7 @@ class SimpleORM {
      * get_all() - Quick get all columns
      */
 	public function get_all() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 
 		$data = array();
 		foreach ( $this->schema as $col => $x ) { $data[$col] = $this->get($col); }
@@ -1084,7 +1175,7 @@ class SimpleORM {
      * clone() - Quick copy of all (currently-set) data in a ready-to-create un-installed object of the same class
      */
 	public function clone_row() {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 
 		$class = get_class($this);
 		$my_clone = new $class(array(), null, $this->dbh);
@@ -1107,7 +1198,7 @@ class SimpleORM {
      */
     public function delete() {
         global $SimpleORM_OBJECT_CACHE;
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $caller_funcs_to_ignore = array('delete','exists','call_user_func_array','do_object_forward_method');
     
         ###  Must be installed and active
@@ -1156,8 +1247,8 @@ class SimpleORM {
     ###  Pre-Cache Sub-Relations
     
     ###  Need to expose some internals for this..
-    protected function __relations() { if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();  return $this->relations; }
-    protected function __schema()    { if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();  return $this->schema; }
+    protected function __relations() { if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);  return $this->relations; }
+    protected function __schema()    { if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);  return $this->schema; }
 
     /**
      * pre_load_sub_relations() - Acts like get_relation(), but pre-load sub-object's in one query (for "has_many" relations only)
@@ -1175,7 +1266,7 @@ class SimpleORM {
      *
      */
     public function pre_load_sub_relations( $name, $sub_relations_to_load, $force_ordered_list = true ) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $caller_funcs_to_ignore = array('pre_load_sub_relations','get','__get','__isset','set','__set','__unset','exists','call_user_func_array','do_object_forward_method');
 
         ###  Must be installed and active
@@ -1328,22 +1419,22 @@ class SimpleORM {
     
     ###  These just use get() and set()
 	public function __get($name) {
-		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 		if ( isset( $this->schema[$name] ) || isset( $this->relations[$name] ) )   return $this->get($name);
 		else if ( isset( $this->$name ) ) return $this->$name; // allow user-set parameters, but on the Singleton object
 	}
     public function __set($name, $value) {
-		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 		if ( isset( $this->schema[$name] ) || isset( $this->relations[$name] ) )  return $this->set(array($name => $value));
 		else return( $this->$name = $value ); // allow user-set parameters, but on the Singleton object
 	}
     public function __isset($name) {
-		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 		if ( isset( $this->schema[$name] ) || isset( $this->relations[$name] ) )  return( ! is_null($this->get($name)) );
 		else return( isset( $this->$name ) ); // allow user-set parameters, but on the Singleton object
 	}
 	public function __unset($name) {
-		if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+		if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
 		if ( isset( $this->schema[$name] ) || isset( $this->relations[$name] ) )  return( $this->set(array($name => null)) );
 		else unset( $this->$name ); // allow user-set parameters, but on the Singleton object
 	}
@@ -1353,16 +1444,22 @@ class SimpleORM {
     ###  Object Forwarding
 
     public function __call($name, $args){
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method($name);
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method($name);
         
         trigger_error( 'Call to undefined method '. get_class($this) .'::'. $name . ' in '. trace_blame_line(array('__call','do_object_forward_method')), E_USER_ERROR);
         return false;
     }
     protected function do_object_forward_method($method_name = null) {
-        $trace = debug_backtrace();
-        if ( ! isset( $method_name ) ) $method_name = $trace[1]['function'];
-        $obj = $this->object_forward;
-        return call_user_func_array(array(&$this->object_forward, $method_name), $trace[1]['args']);
+		$trace = debug_backtrace();
+        if ( ! isset( $method_name ) ) {
+			$method_name = $trace[1]['function'];
+		}
+		if ( ! isset( $GLOBALS['SimpleORM_OBJECT_CACHE'][ $this->dbh ][$this->cache_key] ) ) {
+			trace_dump();
+			bug( "ERROR: Tried to forward to an already-garbage-collected object.  Ref-count:", $GLOBALS['SimpleORM_OBJECT_REFCOUNT'][ $this->dbh ][$this->cache_key], $this->dbh, $this->object_forward, $this->cache_key );
+			exit;
+		}
+        return call_user_func_array(array(&$GLOBALS['SimpleORM_OBJECT_CACHE'][ $this->dbh ][$this->cache_key], $method_name), $trace[1]['args']);
     }
 
 
@@ -1436,7 +1533,7 @@ class SimpleORM {
      *
      */
     public function validate($form = null) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $tmp = func_get_args();  $tmp[] = $this->schema;  return call_user_func_array( 'validate', $tmp );
     }
 
@@ -1455,7 +1552,7 @@ class SimpleORM {
      * @param mixed  $value   The value to be tested
      */
     public function extract_and_validate($form = null) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         $tmp = func_get_args();  $tmp[] = $this->schema;  return call_user_func_array( 'extract_and_validate', $tmp );
     }
 
@@ -1468,7 +1565,7 @@ class SimpleORM {
      * @param mixed  $value   The value to be tested
      */
     public function validate_column_value($col, $value) {
-        if ( isset( $this->object_forward ) ) return $this->do_object_forward_method();
+        if ( $this->object_forward !== null ) return $this->do_object_forward_method(__FUNCTION__);
         return validate_column_value($col, $value, $this->schema);
     }
 
